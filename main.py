@@ -1,10 +1,10 @@
-# ==============================================================================
-# main.py - Autonomous Workstation MCP Hub v2.0
+# ==============================================================================# main.py - Autonomous Workstation MCP Hub v2.3
 #
-# DESIGN: 4 fat tools, not 31 primitives. Complexity lives INSIDE the tools.
+# DESIGN: 5 fat tools, not 31 primitives. Complexity lives INSIDE the tools.
 #   web_task        - open page, act, verify, wait for the product (autopilot)
 #   see             - vision: capture + OCR + landmarks + real MCP image content
-#   chrome_session  - one Chrome session engine (status/debug/tabs/focus)
+#   point           - named click with until-proof (ghost/sniper/flick)
+#   chrome_session  - real Chrome go/type/keys + debug CDP ops
 #   pc              - shell, files, search, processes, kill, notify
 #
 # Agent-facing rules honored here:
@@ -210,22 +210,34 @@ async def point(
 # ==============================================================================
 
 @mcp.tool()
-def chrome_session(op: str = "status", url: str = "") -> Dict[str, Any]:
+def chrome_session(
+    op: str = "status",
+    url: str = "",
+    profile: str = "Kartik",
+    until: str = "",
+    text: str = "",
+    keys: str = "",
+    submit: bool = False,
+) -> Dict[str, Any]:
     """
     One Chrome session engine. Ops:
+      go           - REAL Chrome identity. chrome.exe --profile-directory.
+                     Kartik = Profile 11. Never kill Chrome, never picker,
+                     never debug user-data-dir. Returns already_open if that
+                     profile is already on `url`.
+      type         - type `text` into focused real Chrome; submit=Enter
+      keys         - chord e.g. ctrl+l (real Chrome, SendInput)
+      urlbar       - ctrl+l in real Chrome
       status       - is CDP available, which browser, debug profile state
-      ensure_debug - attach to CDP :9222 if present; else spawn a DEDICATED
-                     debug-profile Chrome (never touches or kills your normal
-                     Chrome window; log into sites in that profile once and
-                     sessions persist)
-      tabs         - list open tabs (url, title)
-      focus        - bring the tab/window matching `url` to front (CDP activate
-                     with Alt-pulse window fallback); returns focus proof
-      open         - open `url` as a new tab
-    CDP is an accelerator, not a dependency: if this is unhealthy, web_task
-    still works through its vision fallback.
+      ensure_debug - dedicated debug-profile Chrome on :9222 (NOT Kartik)
+      tabs         - list open tabs (url, title) via CDP
+      focus        - bring the tab/window matching `url` to front
+      open         - open `url` as a new CDP tab (debug Chrome only)
+    For Kartik / Gmail / NotebookLM always use op=go, never ensure_debug.
     """
-    return chrome_control.dispatch(op, url=url)
+    return chrome_control.dispatch(
+        op, url=url, profile=profile, until=until, text=text, keys=keys, submit=submit,
+    )
 
 
 # ==============================================================================
@@ -330,7 +342,7 @@ async def lifespan(app: FastAPI):
         cal = desktop_native.verify_calibration()
         config.save_status_snapshot({"display": cal})
         print("\n" + "=" * 72)
-        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.1 (5 fat tools)")
+        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.3 (5 fat tools)")
         print(f" [x] Display         : {cal['physical_resolution']} "
               f"(DPI aware: {cal['dpi_aware']}, scaling trap: {cal['scaling_trap_active']})")
         print(f" [x] Bearer Token    : {config.BEARER_TOKEN}")
@@ -342,7 +354,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         print("=" * 72)
-        print(f"[*] SERVER READY & LISTENING: Streamable HTTP running at http://{config.HOST}:{config.PORT}/mcp")
+        print(f"[*] SERVER READY & LISTENING: Streamable HTTP running at {{http://{config.HOST}}}:{config.PORT}/mcp")
         print()
         yield
 
@@ -352,7 +364,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "server": config.SERVER_NAME, "version": "2.0.0"}
+    return {"status": "running", "server": config.SERVER_NAME, "version": "2.3.0"}
 
 
 @app.get("/ping")
@@ -364,7 +376,7 @@ async def ping():
 async def mcp_discovery():
     return {
         "version": "2.0",
-        "serverInfo": {"name": config.SERVER_NAME, "version": "2.0.0"},
+        "serverInfo": {"name": config.SERVER_NAME, "version": "2.3.0"},
         "protocol": "modelcontextprotocol",
         "transport": "streamable-http",
         "endpoints": [
