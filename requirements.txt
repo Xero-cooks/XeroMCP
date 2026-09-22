@@ -1,0 +1,11 @@
+# Autonomous Workstation MCP Hub - pinned dependencies
+# mcp pinned <2 to avoid 2.x breaking changes
+mcp<2
+fastapi
+uvicorn[standard]
+pyautogui
+pillow
+pyperclip
+psutil
+playwright
+requests

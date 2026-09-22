@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head><title>MCP Browser Test Page</title>
+<style>
+  body{font-family:sans-serif;max-width:640px;margin:40px auto}
+  input,textarea{display:block;margin:8px 0;width:100%}
+  #chat{border:1px solid #ccc;padding:10px;min-height:120px;margin-bottom:10px}
+  .assistant{background:#eef;margin:6px 0;padding:6px;border-radius:6px}
+</style>
+</head>
+<body>
+  <h1>MCP Browser Test</h1>
+  <div id="chat"><div class="assistant">Welcome to the test chat.</div></div>
+  <!-- Tiny display:none input MUST be skipped by the composer heuristic -->
+  <input type="text" id="decoy-hidden" style="display:none" value="decoy">
+  <textarea id="composer" rows="4" placeholder="Type here"></textarea>
+  <button id="send" onclick="send()">Send</button>
+<script>
+  function send(){
+    const v = document.getElementById('composer').value;
+    document.getElementById('composer').value = '';
+    // Simulate an assistant "thinking" then replying - lets the hub's
+    // assistant_reply poller be verified end-to-end offline.
+    setTimeout(() => {
+      const div = document.createElement('div');
+      div.className = 'assistant';
+      div.innerText = 'REPLY:' + v;
+      document.getElementById('chat').appendChild(div);
+    }, 1500);
+  }
+</script>
+</body>
+</html>
