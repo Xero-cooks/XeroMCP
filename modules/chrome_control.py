@@ -1,5 +1,4 @@
-# ==============================================================================
-# chrome_control.py - ONE Chrome session engine (no more 4 CDP toys).
+# ==============================================================================# chrome_control.py - ONE Chrome session engine (no more 4 CDP toys).
 #
 # Strategy: "twin debug profile" attach. Since Chrome 136, Google BLOCKS
 # --remote-debugging-port on the DEFAULT User Data dir (flag silently ignored).
@@ -9,6 +8,8 @@
 #      their sites in that profile once; cookies/sessions persist on disk.
 #   3. CDP is an accelerator, never a hard dependency - callers fall back to
 #      UIA/vision when this module reports cdp_available=False.
+# Real-Chrome identity (Kartik / Profile 11) lives in chrome_go.op_go and is
+# NEVER the debug profile.
 # ==============================================================================
 from __future__ import annotations
 
@@ -181,6 +182,7 @@ def op_ensure_debug(start_url: str = "about:blank") -> Dict[str, Any]:
     Attaches to existing :9222 if present; otherwise spawns the dedicated
     debug-profile Chrome (its own user-data-dir -> the Chrome 136+ block does
     not apply). Safe to call every time; idempotent.
+    NOT for Kartik / Gmail / NotebookLM. Use chrome_session op=go instead.
     """
     if cdp_listening():
         info = _cdp_json("/json/version")
@@ -268,12 +270,24 @@ def op_open_tab(url: str) -> Dict[str, Any]:
 
 
 def dispatch(op: str, **kwargs) -> Dict[str, Any]:
+    from . import chrome_go
     ops = {
         "status": op_status,
         "ensure_debug": op_ensure_debug,
         "tabs": op_tabs,
         "focus": lambda: op_focus(kwargs.get("url", "")),
         "open": lambda: op_open_tab(kwargs.get("url", "")),
+        "go": lambda: chrome_go.op_go(
+            url=kwargs.get("url", ""),
+            profile=kwargs.get("profile", "Kartik") or "Kartik",
+            until=kwargs.get("until", "") or "",
+        ),
+        "type": lambda: chrome_go.op_type(
+            text=kwargs.get("text", "") or "",
+            submit=bool(kwargs.get("submit", False)),
+        ),
+        "keys": lambda: chrome_go.op_keys(kwargs.get("keys", "") or ""),
+        "urlbar": lambda: chrome_go.op_urlbar(),
     }
     fn = ops.get(op)
     if fn is None:
