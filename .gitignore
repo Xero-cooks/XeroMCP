@@ -1,2 +1,11 @@
-
 .chrome_debug_profile/
+.chrome_identity_cache.json
+.mcp_token
+.mcp_status.json
+.mcp_inspections/
+__pycache__/
+*.py[cod]
+*.log
+server.log
+.venv/
+venv/
