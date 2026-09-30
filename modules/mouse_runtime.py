@@ -75,24 +75,186 @@ if desktop_native.IS_WINDOWS:
     _GA_ROOT = 2
 
 
-def _send_mouse(flags: int, data: int = 0) -> None:
+from modules.input_lock import INPUT_LOCK
+
+if desktop_native.IS_WINDOWS:
+    _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    _user32.SendInput.restype = wintypes.UINT
+    _user32.GetCursorPos.argtypes = (ctypes.POINTER(_POINT),)
+    _user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+    _user32.SetCursorPos.restype = wintypes.BOOL
+    _user32.WindowFromPoint.argtypes = (_POINT,)
+    _user32.WindowFromPoint.restype = wintypes.HWND
+    _user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    _user32.GetAncestor.restype = wintypes.HWND
+
+
+class InputError(RuntimeError):
+    """SendInput/SetCursorPos refused: UIPI (elevated target), secure
+    desktop (locked / UAC prompt) or an invalid coordinate."""
+
+
+def _mk(flags: int, data: int = 0) -> "_INPUT":
     inp = _INPUT(type=0)
     inp.union.mi.dwFlags = flags
-    inp.union.mi.mouseData = data
-    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    inp.union.mi.mouseData = ctypes.c_ulong(data & 0xFFFFFFFF).value
+    return inp
+
+
+def _send_inputs(events: List["_INPUT"]) -> None:
+    """Send a gesture atomically; raise if Windows rejected any event."""
+    arr = (_INPUT * len(events))(*events)
+    sent = _user32.SendInput(len(events), arr, ctypes.sizeof(_INPUT))
+    if sent != len(events):
+        # never leave a button stuck down after a partial batch
+        ups = [_mk(f) for f in (_LEFT_UP, _RIGHT_UP, _MIDDLE_UP)]
+        _user32.SendInput(len(ups), (_INPUT * len(ups))(*ups), ctypes.sizeof(_INPUT))
+        raise InputError(f"SendInput injected {sent}/{len(events)} events "
+                         f"(error {ctypes.GetLastError()}): target may be elevated or desktop locked")
+
+
+def _send_mouse(flags: int, data: int = 0) -> None:
+    _send_inputs([_mk(flags, data)])
+
+
+def cursor_pos() -> Tuple[int, int]:
+    pt = _POINT()
+    if not _user32.GetCursorPos(ctypes.byref(pt)):
+        raise InputError("GetCursorPos failed (secure desktop?)")
+    return int(pt.x), int(pt.y)
 
 
 def _warp_to(x: int, y: int) -> None:
-    _user32.SetCursorPos(int(x), int(y))
+    if not _user32.SetCursorPos(int(x), int(y)):
+        raise InputError(f"SetCursorPos({x},{y}) failed")
+
+
+def move_to(x: int, y: int, tolerance: int = 0, verify: bool = True) -> Dict[str, Any]:
+    """Absolute physical move. Skips the move when the cursor is already
+    within `tolerance` px; verifies the hotspot landed (DPI/virtualisation
+    bugs show up here as a mismatch instead of a silent wrong click)."""
+    cx, cy = cursor_pos()
+    if abs(cx - x) <= tolerance and abs(cy - y) <= tolerance:
+        return {"moved": False, "at": (cx, cy)}
+    _warp_to(x, y)
+    if verify:
+        ax, ay = cursor_pos()
+        if abs(ax - x) > 1 or abs(ay - y) > 1:
+            # one retry: another input source may have raced us
+            _warp_to(x, y)
+            ax, ay = cursor_pos()
+            if abs(ax - x) > 1 or abs(ay - y) > 1:
+                raise InputError(f"cursor landed at ({ax},{ay}) not ({x},{y}) - coordinate "
+                                 "transform or DPI virtualisation problem")
+        return {"moved": True, "at": (ax, ay)}
+    return {"moved": True, "at": (x, y)}
+
+
+_BTN = {"left": (_LEFT_DOWN, _LEFT_UP), "right": (_RIGHT_DOWN, _RIGHT_UP),
+        "middle": (_MIDDLE_DOWN, _MIDDLE_UP)} if desktop_native.IS_WINDOWS else {}
+
+
+def click_at(x: int, y: int, button: str = "left", count: int = 1, settle_ms: int = 10) -> Dict[str, Any]:
+    """Move (if needed) + ONE atomic SendInput batch of down/up pairs. A
+    double click is two pairs in the same batch -> always inside the
+    system double-click time, never split by other input."""
+    down, up = _BTN.get(button, _BTN["left"])
+    with INPUT_LOCK:
+        mv = move_to(x, y, tolerance=0)
+        if mv["moved"]:
+            time.sleep(settle_ms / 1000.0)   # let hover/hit-testing catch up
+        _send_inputs([_mk(f) for _ in range(max(1, min(3, count))) for f in (down, up)])
+    return {"moved": mv["moved"]}
+
+
+def drag_path(x: int, y: int, x2: int, y2: int, steps: int = 12, hold_ms: int = 40,
+              step_ms: int = 12, button: str = "left") -> Dict[str, Any]:
+    """Press at (x,y), exceed the system drag threshold, travel, release.
+    The button is ALWAYS released (finally), even on errors."""
+    down, up = _BTN.get(button, _BTN["left"])
+    with INPUT_LOCK:
+        move_to(x, y)
+        time.sleep(0.01)
+        _send_inputs([_mk(down)])
+        try:
+            time.sleep(hold_ms / 1000.0)
+            thr = max(4, int(_user32.GetSystemMetrics(68)) + 2)  # SM_CXDRAG
+            dx = thr if x2 >= x else -thr
+            _warp_to(x + dx, y)                                  # break the drag threshold
+            time.sleep(step_ms / 1000.0)
+            n = max(2, steps)
+            for i in range(1, n + 1):
+                _warp_to(int(round(x + (x2 - x) * i / n)), int(round(y + (y2 - y) * i / n)))
+                time.sleep(step_ms / 1000.0)
+            time.sleep(hold_ms / 1000.0)                          # drop targets need a beat
+        finally:
+            _send_inputs([_mk(up)])
+    return {"moved": True}
+
+
+def scroll_at(x: Optional[int], y: Optional[int], amount: int) -> Dict[str, Any]:
+    amt = max(-50, min(50, int(amount)))
+    if amt == 0:
+        raise ValueError("scroll amount must be non-zero (wheel notches, + = up)")
+    with INPUT_LOCK:
+        if x is not None and y is not None:
+            move_to(x, y, tolerance=2)
+            time.sleep(0.01)
+        _send_inputs([_mk(_WHEEL, 120 if amt > 0 else -120) for _ in range(abs(amt))])
+    return {"notches": amt}
+
+
+def execute_pointer(verb: str, x: int, y: int, x2: Optional[int] = None, y2: Optional[int] = None,
+                    amount: int = 0, motion: str = "sniper") -> Dict[str, Any]:
+    """The single physical-execution entry point for XeroSpatial.
+    Returns {ok, motion} or {ok: False, status, error}. Never raises."""
+    try:
+        if verb == "click":
+            if motion == "human":
+                cx, cy = cursor_pos()
+                with INPUT_LOCK:
+                    _motion_flick(cx, cy, x, y)
+                return {"ok": True, "motion": "flick"}
+            click_at(x, y, "left", 1)
+        elif verb == "double_click":
+            click_at(x, y, "left", 2)
+        elif verb == "right_click":
+            click_at(x, y, "right", 1)
+        elif verb in ("move", "hover"):
+            with INPUT_LOCK:
+                move_to(x, y, tolerance=0)
+            if verb == "hover":
+                time.sleep(0.25)
+        elif verb == "drag":
+            if x2 is None or y2 is None:
+                return {"ok": False, "status": "bad_request", "error": "drag needs an end point"}
+            drag_path(x, y, x2, y2)
+        elif verb == "scroll":
+            scroll_at(x, y, amount)
+        else:
+            return {"ok": False, "status": "bad_request", "error": f"unknown pointer verb {verb!r}"}
+        return {"ok": True, "motion": "warp"}
+    except InputError as e:
+        return {"ok": False, "status": "input_blocked", "error": str(e)}
+    except ValueError as e:
+        return {"ok": False, "status": "bad_request", "error": str(e)}
+    except Exception as e:  # report, never swallow
+        return {"ok": False, "status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 def _window_under_point(x: int, y: int) -> Tuple[Optional[int], str]:
+    hwnd, title, _pid = window_under_point_ex(x, y)
+    return hwnd, title
+
+
+def window_under_point_ex(x: int, y: int) -> Tuple[Optional[int], str, int]:
     pt = _POINT(int(x), int(y))
     hwnd = _user32.WindowFromPoint(pt)
     if not hwnd:
-        return None, ""
+        return None, "", 0
     root = _user32.GetAncestor(hwnd, _GA_ROOT) or hwnd
-    return int(root), desktop_native._get_window_title(root)
+    root = int(root)
+    return root, desktop_native._get_window_title(root), desktop_native.window_pid(root)
 
 
 # ------------------------------------------------------------------------------
@@ -108,10 +270,18 @@ class _UiaBridge:
         self._out_q: "queue.Queue[str]" = None  # set in _spawn
         self._reader: Optional[threading.Thread] = None
         self._resp_q: "queue.Queue[dict]" = None
+        self._timeouts = 0
         self._spawn()
 
     def _spawn(self) -> None:
         import queue
+        old = self._proc
+        if old is not None and old.poll() is None:
+            try:
+                old.kill()      # never leak a hung PowerShell child
+            except Exception:
+                pass
+        self._timeouts = 0
         self._resp_q = queue.Queue()
         self._proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
@@ -165,9 +335,16 @@ class _UiaBridge:
                 try:
                     resp = self._resp_q.get(timeout=max(0.05, deadline - time.monotonic()))
                     if resp.get("id") == req_id:
+                        self._timeouts = 0
                         return resp
+                    # else: a late answer to an earlier timed-out request - drop it
                 except Exception:
                     break
+            # Timed out. Two in a row = the bridge is wedged (huge UIA tree,
+            # hung provider): recycle it instead of paying the timeout forever.
+            self._timeouts += 1
+            if self._timeouts >= 2:
+                self._spawn()
             return None
 
     def ping(self) -> bool:
@@ -177,15 +354,30 @@ class _UiaBridge:
         return bool(resp and resp.get("ok"))
 
     def find(self, name: str, window: str = "", limit: int = 12,
-             timeout: float = 3.0) -> Optional[List[Dict[str, Any]]]:
-        resp = self._request({"op": "find", "name": name, "window": window, "limit": limit},
-                             timeout=timeout)
-        if resp and resp.get("ok"):
-            return resp.get("candidates", [])
-        return None if (resp is None) else []
+             timeout: float = 3.0, hwnd: Optional[int] = None) -> Optional[List[Dict[str, Any]]]:
+        """[] = scanned cleanly, nothing matched; None = could not scan
+        (bridge down, timeout, window not found) -> callers fall through."""
+        req: Dict[str, Any] = {"op": "find", "name": name, "window": window, "limit": limit}
+        if hwnd:
+            req["hwnd"] = int(hwnd)
+        resp = self._request(req, timeout=timeout)
+        if resp is None:
+            return None
+        if resp.get("error") and resp.get("error") != "element_not_found":
+            return None
+        return [c for c in (resp.get("candidates") or [])
+                if c.get("enabled", True) is not False and c.get("w", 0) > 0 and c.get("h", 0) > 0]
 
-    def invoke(self, name: str, window: str = "", index: int = 0) -> Optional[Dict[str, Any]]:
-        return self._request({"op": "invoke", "name": name, "window": window, "index": index})
+    def invoke(self, name: str, window: str = "", index: int = 0,
+               rect: Optional[Dict[str, int]] = None, hwnd: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Invoke the element whose bounds match `rect` (the candidate we
+        actually scored) - not merely the Nth name match."""
+        req: Dict[str, Any] = {"op": "invoke", "name": name, "window": window, "index": index}
+        if rect:
+            req["rect"] = {k: int(rect[k]) for k in ("x", "y", "w", "h")}
+        if hwnd:
+            req["hwnd"] = int(hwnd)
+        return self._request(req)
 
 
 _BRIDGE: Optional[_UiaBridge] = None
@@ -213,7 +405,8 @@ def _bridge() -> Optional[_UiaBridge]:
 # Eyes cache + last-seen memory (speculative pre-aim)
 # ------------------------------------------------------------------------------
 
-_EYES: Dict[str, Any] = {"lines": [], "origin": (0, 0), "ts": 0.0, "window": "", "size": (0, 0)}
+_EYES: Dict[str, Any] = {"lines": [], "origin": (0, 0), "ts": 0.0, "window": "", "size": (0, 0),
+                         "hwnd": None}
 _EYES_TTL = 1.2
 _LAST_SEEN: Dict[str, Tuple[Dict[str, int], float]] = {}
 _LAST_SEEN_TTL = 10.0
@@ -221,16 +414,22 @@ _MEM_LOCK = threading.Lock()
 
 
 def feed_eyes(pil_img, ocr_lines: List[Dict[str, Any]], origin: Tuple[int, int] = (0, 0),
-              window: str = "") -> None:
+              window: str = "", hwnd: Optional[int] = None) -> None:
     """Called by `see` after every capture: the runtime always holds the last
     frame's boxes so a hit can start aiming before a new screenshot develops."""
     with _MEM_LOCK:
         _EYES.update(lines=ocr_lines, origin=tuple(origin), ts=time.monotonic(),
-                     window=window or "", size=(pil_img.width, pil_img.height))
+                     window=window or "", size=(pil_img.width, pil_img.height),
+                     hwnd=hwnd if hwnd is not None else desktop_native._get_active_hwnd())
 
 
-def _eyes_fresh() -> bool:
-    return _EYES["lines"] and (time.monotonic() - _EYES["ts"]) < _EYES_TTL
+def _eyes_fresh(hwnd: Optional[int] = None) -> bool:
+    """Fresh = young AND captured for the window we are about to act on.
+    (Before: OCR boxes from ANY window were reused for 1.2 s.)"""
+    if not _EYES["lines"] or (time.monotonic() - _EYES["ts"]) >= _EYES_TTL:
+        return False
+    cur = hwnd if hwnd is not None else desktop_native._get_active_hwnd()
+    return _EYES.get("hwnd") in (None, cur)
 
 
 def _remember(label: str, box: Dict[str, int]) -> None:
@@ -251,10 +450,23 @@ def _recall(label: str) -> Optional[Dict[str, int]]:
 # ------------------------------------------------------------------------------
 
 def _exclusion_zones() -> List[Tuple[int, int, int, int]]:
-    """Taskbar band + bottom-right toast area - classic false-positive zones."""
+    """Real taskbar/appbar rects of every monitor (work area vs bounds) + the
+    DPI-scaled toast corner of the primary. Falls back to the old guess."""
+    try:
+        from modules.spatial.displays import get_displays
+        zones: List[Tuple[int, int, int, int]] = []
+        for d in get_displays(fallback_size=desktop_native.screen_size()):
+            zones += [(r.x, r.y, r.w, r.h) for r in d.taskbar_rects()]
+            if d.primary:
+                s_ = d.scale
+                zones.append((d.work.right - int(440 * s_), d.work.bottom - int(230 * s_),
+                              int(432 * s_), int(224 * s_)))
+        if zones:
+            return zones
+    except Exception:
+        pass
     W, H = desktop_native.screen_size()
-    return [(0, H - 56, W, 56),            # taskbar
-            (W - 440, H - 280, 432, 224)]  # toasts (Restore pages etc.)
+    return [(0, H - 56, W, 56), (W - 440, H - 280, 432, 224)]
 
 
 def _in_exclusions(cx: float, cy: float) -> bool:
@@ -386,29 +598,23 @@ def _lock_window(window: str) -> Dict[str, Any]:
             return {"ok": False, "error": f"window focus failed: {proof.get('error', 'unknown')}"}
         hwnd = proof["hwnd"]
         title = proof.get("target_title", "")
-    rect = None
-    if hwnd:
-        r = wintypes.RECT()
-        if _user32.GetWindowRect(hwnd, ctypes.byref(r)):
-            rect = {"x": int(r.left), "y": int(r.top),
-                    "w": int(r.right - r.left), "h": int(r.bottom - r.top)}
-    return {"ok": True, "hwnd": hwnd, "title": title, "rect": rect}
+    rect = desktop_native.window_rect(hwnd) if hwnd else None
+    return {"ok": True, "hwnd": hwnd, "title": title, "rect": rect,
+            "pid": desktop_native.window_pid(hwnd) if hwnd else 0}
 
 
 def _capture_for_aim(win_rect: Optional[Dict[str, int]]):
-    """Capture pixels to aim against: window crop when possible, else desktop."""
+    """Capture pixels to aim against (IN MEMORY - no more region_*.jpg per
+    click on disk): window crop when possible, else the virtual desktop."""
     if win_rect and win_rect["w"] > 40 and win_rect["h"] > 40:
-        shot = desktop_native.take_region_screenshot(win_rect["x"], win_rect["y"],
-                                                     win_rect["w"], win_rect["h"], quality=90)
-        origin = (win_rect["x"], win_rect["y"])
+        img = desktop_native.grab(win_rect["x"], win_rect["y"], win_rect["w"], win_rect["h"])
+        vs = desktop_native.virtual_screen()
+        origin = (max(win_rect["x"], vs["x"]), max(win_rect["y"], vs["y"]))
     else:
-        shot = desktop_native.take_screenshot(scaled_width=0, quality=90)
-        origin = (0, 0)
-    path = shot.get("inspection_image_path")
-    if not path:
-        return None, origin
-    from PIL import Image
-    return Image.open(path), origin
+        vs = desktop_native.virtual_screen()
+        img = desktop_native.grab()
+        origin = (vs["x"], vs["y"])
+    return img, origin
 
 
 # ------------------------------------------------------------------------------
@@ -451,7 +657,7 @@ def _resolve_target(target: Any, near: str, role: str, window: str,
                                   "invoke": bool(c.get("invoke") or c.get("toggle") or c.get("legacy"))})
 
         # Pass 1: descendants of the top-level window (fast, warm).
-        p1 = br.find(query, window=window, timeout=_uia_t)
+        p1 = br.find(query, window=window, timeout=_uia_t, hwnd=win_info.get("hwnd") if window else None)
         _collect(p1)
         # Pass 2 (desktop-wide popup scan) ONLY when pass 1 timed out/errored
         # (None) or no window was scoped. A clean empty list means the window
@@ -462,7 +668,7 @@ def _resolve_target(target: Any, near: str, role: str, window: str,
     # ---- 2. OCR: fresh eyes cache or a new window crop ----
     ocr_lines: List[Dict[str, Any]] = []
     origin = (0, 0)
-    if _eyes_fresh():
+    if _eyes_fresh(win_info.get("hwnd")):
         ocr_lines = _EYES["lines"]
         origin = tuple(_EYES["origin"])
     else:
@@ -480,11 +686,20 @@ def _resolve_target(target: Any, near: str, role: str, window: str,
         _remember(query, bx)
 
     # ---- 3. last-seen memory ----
+    # Memory is a PRIOR, never truth: re-read the remembered spot (small crop
+    # OCR) and only use it if the label is still there. (Before: the runtime
+    # clicked a 10-second-old box blindly when UIA and OCR both missed.)
     mem_cands: List[Dict[str, Any]] = []
     mem = _recall(query)
     if mem and not uia_cands and not ocr_cands:
-        mem_cands.append({**mem, "cx": mem["x"] + mem["w"] / 2, "cy": mem["y"] + mem["h"] / 2,
-                          "name": query, "ctype": "memory", "invoke": False})
+        pad = 24
+        crop = desktop_native.grab(mem["x"] - pad, mem["y"] - pad, mem["w"] + 2 * pad, mem["h"] + 2 * pad)
+        if crop is not None:
+            ox, oy = mem["x"] - pad, mem["y"] - pad
+            for ln in _find_all_ocr(ocr_image_sync(crop).get("lines", []), query)[:1]:
+                bx = {"x": ln["x"] + ox, "y": ln["y"] + oy, "w": ln["w"], "h": ln["h"]}
+                mem_cands.append({**bx, "cx": bx["x"] + bx["w"] / 2, "cy": bx["y"] + bx["h"] / 2,
+                                  "name": ln["text"], "ctype": "memory", "invoke": False})
 
     # ---- resolve 'near' anchor from the same OCR lines ----
     if near:
@@ -515,9 +730,7 @@ def _resolve_target(target: Any, near: str, role: str, window: str,
     # ---- 4. role refinement: avatar/icon -> circle above the label ----
     if role in ("avatar", "icon") and method == "ocr":
         img = None
-        if _eyes_fresh():
-            pass  # cache lines only; need pixels for blob -> recapture crop
-        img, org = _capture_for_aim(win_info.get("rect"))
+        img, org = _capture_for_aim(win_info.get("rect"))  # need pixels for the blob
         if img is not None:
             lbl = {"x": best["x"] - org[0], "y": best["y"] - org[1], "w": best["w"], "h": best["h"]}
             blob = _color_blob_above(img, lbl)
@@ -528,7 +741,9 @@ def _resolve_target(target: Any, near: str, role: str, window: str,
                 method = "ocr+colorblob"
 
     return {"ok": True, "kind": "box", "x": x, "y": y, "box": box, "method": method,
-            "invoke": bool(best.get("invoke")), "name": best.get("name", "")}
+            "invoke": bool(best.get("invoke")) and method == "uia", "name": best.get("name", ""),
+            "ctype": best.get("ctype", "") if method == "uia" else "",
+            "uia_rect": {k: int(best[k]) for k in ("x", "y", "w", "h")} if method == "uia" else None}
 
 
 # ------------------------------------------------------------------------------
@@ -559,11 +774,15 @@ def _uia_text_present(text: str, window: str, timeout: float = 1.2) -> Optional[
     return len(found) > 0
 
 
-def _ocr_window_text(win_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _ocr_window_text(win_info: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Fresh OCR of the target window. None = could not read (capture or OCR
+    engine failed) - which must never be mistaken for 'text is gone'."""
     img, origin = _capture_for_aim(win_info.get("rect"))
     if img is None:
-        return []
+        return None
     res = ocr_image_sync(img)
+    if res.get("engine") == "none":
+        return None
     return res.get("lines", [])
 
 
@@ -582,7 +801,7 @@ def _check_until(kind: str, needle: str, win_info: Dict[str, Any],
             hit = any(needle in (t.get("url") or "") for t in tabs)
             return {"until_ok": hit, "how": "cdp_urls"}
         except Exception as e:
-            return {"until_ok": False, "how": "cdp_urls", "error": str(e)}
+            return {"until_ok": False, "how": "cdp_urls", "error": f"cdp unavailable: {type(e).__name__}"}
     # UIA fast path (menus/popup HWNDs are handled inside the bridge)
     present = None
     if time_left > 0.35:
@@ -592,6 +811,8 @@ def _check_until(kind: str, needle: str, win_info: Dict[str, Any],
     # UIA absent (or bridge down) is INCONCLUSIVE, never final - pixels decide.
     # (Win11 notepad's edit text, popup menus etc. are blind spots for UIA.)
     lines = pre_ocr_lines if pre_ocr_lines is not None else _ocr_window_text(win_info)
+    if lines is None:
+        return {"until_ok": False, "how": "ocr", "error": "ocr unavailable - cannot prove"}
     present_v = bool(_find_all_ocr(lines, needle))
     return {"until_ok": (kind == "contains") == present_v, "how": "ocr"}
 
@@ -613,14 +834,8 @@ def _pixel_delta(before_img, after_img, cx: int, cy: int, half: int = 24) -> flo
 # ------------------------------------------------------------------------------
 
 def _motion_warp_click(x: int, y: int, button: str = "left", settle_ms: int = 10) -> None:
-    _warp_to(x, y)
-    time.sleep(settle_ms / 1000.0)  # let the cursor hotspot land before firing
-    if button == "right":
-        _send_mouse(_RIGHT_DOWN); time.sleep(0.008); _send_mouse(_RIGHT_UP)
-    elif button == "middle":
-        _send_mouse(_MIDDLE_DOWN); time.sleep(0.008); _send_mouse(_MIDDLE_UP)
-    else:
-        _send_mouse(_LEFT_DOWN); time.sleep(0.008); _send_mouse(_LEFT_UP)
+    """Back-compat alias; the hardened path is click_at()."""
+    click_at(x, y, button, 1, settle_ms)
 
 
 _FLICK_TABLE = [(200, 1, 0.024), (800, 2, 0.044), (10**9, 3, 0.068)]  # (dist, segs, cap_s)
@@ -642,19 +857,46 @@ def _motion_flick(x0: int, y0: int, x1: int, y1: int) -> None:
         time.sleep(total / n * 0.5)
     _warp_to(x1, y1)
     time.sleep(0.008)
-    _send_mouse(_LEFT_DOWN); time.sleep(0.008); _send_mouse(_LEFT_UP)
+    _send_inputs([_mk(_LEFT_DOWN), _mk(_LEFT_UP)])
 
 
 # ------------------------------------------------------------------------------
 # Public entry: the point engine (sync; runs on the single mouse worker thread)
 # ------------------------------------------------------------------------------
 
+def _probe(x: int, y: int, half: int = 24):
+    """48 px in-memory crop around the hit point (visual-delta evidence)."""
+    try:
+        return desktop_native.grab(x - half, y - half, 2 * half, 2 * half)
+    except Exception:
+        return None
+
+
+_GHOST_OK = ("button", "menuitem", "hyperlink", "listitem", "tabitem",
+             "checkbox", "radiobutton", "treeitem", "splitbutton")
+# Re-clicking these flips state back -> a retry would UNDO the user's action.
+_NO_RETRY = ("checkbox", "radiobutton", "toggle", "combobox", "edit", "slider", "treeitem")
+
+
 def point_sync(do: str = "click", target: Any = None, target2: Any = None,
                near: str = "", window: str = "", until: str = "", role: str = "",
                motion: str = "sniper", timeout_ms: int = 1500,
                dx: int = 0, dy: int = 0, amount: int = 0) -> Dict[str, Any]:
+    try:
+        with INPUT_LOCK:
+            return _point_sync(do, target, target2, near, window, until, role, motion,
+                               timeout_ms, dx, dy, amount)
+    except InputError as e:
+        return {"status": "input_blocked", "error": str(e)}
+    except Exception as e:  # never swallow silently, never crash the tool
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+def _point_sync(do, target, target2, near, window, until, role, motion,
+                timeout_ms, dx, dy, amount) -> Dict[str, Any]:
     t0 = time.monotonic()
     do = (do or "click").lower()
+    do = {"double_click": "double", "right_click": "right", "hover": "move"}.get(do, do)
     budget = max(400, timeout_ms) / 1000.0
 
     def _ms() -> int:
@@ -664,19 +906,34 @@ def point_sync(do: str = "click", target: Any = None, target2: Any = None,
         br = _bridge()
         return {"status": "ok", "bridge_alive": bool(br and br.alive()),
                 "eyes_age_ms": int((time.monotonic() - _EYES["ts"]) * 1000) if _EYES["ts"] else None,
-                "last_seen_entries": len(_LAST_SEEN)}
+                "last_seen_entries": len(_LAST_SEEN), "dpi_mode": desktop_native.dpi_mode()}
+    if do not in ("click", "double", "right", "move", "drag", "scroll"):
+        return {"status": "failed", "error": f"unknown do={do!r}",
+                "valid": ["click", "double", "right", "move", "drag", "scroll", "status"]}
 
     # ---- 1. lock the window (abort rather than click the wrong app) ----
     win_info = _lock_window(window)
     if not win_info.get("ok"):
         return {"status": "failed", "error": win_info.get("error"), "ms": _ms()}
 
-    # ---- 2. scroll has no target requirement ----
+    # ---- 2. scroll: at the target when given, else where the cursor is ----
     if do == "scroll":
-        amt = int(amount or 0)
-        _send_mouse(_WHEEL, data=amt * 120)  # WHEEL_DELTA=120 per click
-        time.sleep(0.05)
-        return {"status": "ok", "action": "scroll", "amount": amt, "ms": _ms()}
+        sx = sy = None
+        if target is not None:
+            aim_s = _resolve_target(target, near, role, window, win_info, budget)
+            if not aim_s.get("ok"):
+                return {"status": aim_s.get("error", "failed"), "error": aim_s.get("error"), "ms": _ms()}
+            sx, sy = aim_s["x"], aim_s["y"]
+        if not int(amount or 0):
+            return {"status": "failed", "error": "amount must be non-zero (+ = up)", "ms": _ms()}
+        before = _probe(*(cursor_pos() if sx is None else (sx, sy)))
+        r = scroll_at(sx, sy, int(amount))
+        time.sleep(0.08)
+        after = _probe(*(cursor_pos() if sx is None else (sx, sy)))
+        vd = _pixel_delta(before, after, 24, 24) if before is not None and after is not None else -1
+        return {"status": "hit" if vd >= 1.5 else "fired_unverified", "action": "scroll",
+                "amount": r["notches"], "visual_delta": round(vd, 1) if vd >= 0 else None,
+                "proof": {"until_ok": vd >= 1.5, "how": "visual_delta"}, "ms": _ms()}
 
     if target is None:
         return {"status": "failed", "error": "target required", "ms": _ms()}
@@ -688,125 +945,110 @@ def point_sync(do: str = "click", target: Any = None, target2: Any = None,
                 "error": aim.get("error"), "candidates": aim.get("candidates"),
                 "ms": _ms()}
     x, y = aim["x"] + int(dx), aim["y"] + int(dy)
-    x = max(0, min(x, desktop_native.screen_size()[0] - 1))
-    y = max(0, min(y, desktop_native.screen_size()[1] - 1))
+    vs = desktop_native.virtual_screen()          # ALL monitors, not just primary
+    x = max(vs["x"], min(x, vs["x"] + vs["w"] - 1))
+    y = max(vs["y"], min(y, vs["y"] + vs["h"] - 1))
 
     u_kind, u_needle = _parse_until(until)
-    pre_lines: Optional[List[Dict[str, Any]]] = None
+    pre_present: Optional[bool] = None
     if u_kind == "gone":
-        # pre-frame baseline is ONLY meaningful for 'gone' checks (was there
-        # before, must be absent after). 'contains' always reads fresh pixels -
-        # the pre-frame by definition lacks the text the click just produced.
-        if not _eyes_fresh():
-            pre_lines = _ocr_window_text(win_info)
-        else:
-            pre_lines = _EYES["lines"]
+        # Baseline ONLY to confirm the text existed before the click. It must
+        # never be used as the post-click proof (that made the first check
+        # always fail -> a guaranteed extra click).
+        pre = _EYES["lines"] if _eyes_fresh(win_info.get("hwnd")) else _ocr_window_text(win_info)
+        pre_present = bool(_find_all_ocr(pre or [], u_needle)) if pre is not None else None
 
-    if do in ("move", "hover"):
-        _warp_to(x, y)
+    if do == "move":
+        move_to(x, y)
         time.sleep(0.03)
+        cx, cy = cursor_pos()
+        on = abs(cx - x) <= 1 and abs(cy - y) <= 1
         hwnd, title = _window_under_point(x, y)
-        return {"status": "ok", "action": do, "hit": {"x": x, "y": y, "method": aim["method"]},
+        return {"status": "hit" if on else "fired_unverified", "action": do,
+                "hit": {"x": x, "y": y, "method": aim["method"]},
+                "proof": {"until_ok": on, "how": "cursor_position"},
                 "window_under_point": title, "ms": _ms()}
 
-    # ---- 4. fire (ghost -> warp; flick only on request) ----
-    before_hwnd, before_title = _window_under_point(x, y)
-    # 48px before-crop around the hit for the visual-delta proof
-    bx0, by0 = max(0, x - 24), max(0, y - 24)
-    before_shot = desktop_native.take_region_screenshot(bx0, by0, 48, 48, quality=95)
-    before_crop = None
-    _bp = before_shot.get("inspection_image_path")
-    if _bp:
-        try:
-            from PIL import Image as _PILImage
-            before_crop = _PILImage.open(_bp)
-        except Exception:
-            before_crop = None
-    fired = False
-    used_motion = ""
-    # Ghost only for elements whose control type actually activates on
-    # Invoke/Toggle - NOT menu BAR items (their toggle does nothing) and not
-    # avatars (we must hit the circle, UIA invoke hits the label).
-    _GHOST_OK = ("button", "menuitem", "hyperlink", "listitem", "tabitem",
-                 "checkbox", "radiobutton", "combobox", "treeitem")
-    if do in ("click", "double", "right") and motion != "human" and aim.get("invoke") \
-            and role not in ("avatar", "icon") \
-            and any(g in (aim.get("ctype") or "").lower() for g in _GHOST_OK):
-        br = _bridge()
-        if br is not None:
-            resp = br.invoke(aim.get("name") or (target if isinstance(target, str) else ""),
-                             window=window)
-            if resp and resp.get("ok"):
-                fired, used_motion = True, f"ghost:{resp.get('how', 'invoke')}"
-    if not fired and do in ("click", "double", "right") and motion == "human":
-        _motion_flick(x - 140, y - 90, x, y)
-        used_motion = "flick"
-        fired = True
-    if not fired:
-        if do == "move":
-            pass
-        elif do == "right":
-            _motion_warp_click(x, y, "right")
-        elif do == "double":
-            _motion_warp_click(x, y)
-            time.sleep(0.03)
-            _motion_warp_click(x, y)
-        else:
-            _motion_warp_click(x, y)
-        used_motion = used_motion or "warp"
-        fired = True
-
-    # drag / drag-with-two-targets
+    # ---- 4. drag has its own gesture (and NEVER a click first) ----
     if do == "drag":
-        aim2 = _resolve_target(target2 or target, "", "", window, win_info, budget)
+        aim2 = _resolve_target(target2 if target2 is not None else target, "", "", window, win_info, budget)
         if not aim2.get("ok"):
             return {"status": "failed", "error": "drag end target not found", "ms": _ms()}
         x2, y2 = aim2["x"], aim2["y"]
-        _warp_to(x, y)
-        _send_mouse(_LEFT_DOWN)
-        steps = 6
-        for i in range(1, steps + 1):
-            _warp_to(int(x + (x2 - x) * i / steps), int(y + (y2 - y) * i / steps))
-            time.sleep(0.012)
-        _send_mouse(_LEFT_UP)
-        return {"status": "ok", "action": "drag",
-                "from": {"x": x, "y": y}, "to": {"x": x2, "y": y2}, "ms": _ms()}
+        drag_path(x, y, x2, y2)
+        proof = {"until_ok": None, "how": "none"}
+        if u_kind:
+            time.sleep(0.12)
+            proof = _check_until(u_kind, u_needle, win_info, None, time.monotonic() + max(0.9, budget))
+        return {"status": "hit" if proof.get("until_ok") else "fired_unverified", "action": "drag",
+                "from": {"x": x, "y": y}, "to": {"x": x2, "y": y2}, "proof": proof, "ms": _ms()}
 
-    # ---- 5. proof in the same breath (+ click storm retry) ----
+    # ---- 5. fire (ghost -> warp; flick only on request) ----
+    before_hwnd, before_title = _window_under_point(x, y)
+    before_crop = _probe(x, y)
+    fired = False
+    used_motion = ""
+    ctype = (aim.get("ctype") or "").lower()
+    # Ghost = UIA Invoke. Only for a plain left click (Invoke is NOT a right
+    # or double click), only on the exact element we scored (rect-matched),
+    # and never for avatars (we must hit the circle, not the label).
+    if do == "click" and motion != "human" and aim.get("invoke") \
+            and role not in ("avatar", "icon") and any(g in ctype for g in _GHOST_OK):
+        br = _bridge()
+        if br is not None:
+            resp = br.invoke(aim.get("name") or (target if isinstance(target, str) else ""),
+                             window=window, rect=aim.get("uia_rect"),
+                             hwnd=win_info.get("hwnd") if window else None)
+            if resp and resp.get("ok"):
+                fired, used_motion = True, f"ghost:{resp.get('how', 'invoke')}"
+    if not fired and do == "click" and motion == "human":
+        cx0, cy0 = cursor_pos()
+        _motion_flick(cx0, cy0, x, y)
+        used_motion, fired = "flick", True
+    if not fired:
+        button = "right" if do == "right" else "left"
+        click_at(x, y, button, 2 if do == "double" else 1)
+        used_motion, fired = "warp", True
+
+    # ---- 6. proof in the same breath (+ SAFE retry) ----
     tries = 1
-    proof: Dict[str, Any] = {"until_ok": True, "how": "none"}
+    proof: Dict[str, Any] = {"until_ok": None, "how": "no_until"}
     if u_kind:
-        # Proof gets its own floor even if aiming consumed most of the budget:
-        # a 'fired_unverified' caused by an expired clock is a lie of a result.
         deadline = time.monotonic() + max(0.9, budget - (time.monotonic() - t0))
         time.sleep(0.12)  # let the UI react (menus render a beat after the click)
-        proof = _check_until(u_kind, u_needle, win_info,
-                             pre_lines if u_kind == "gone" else None, deadline)
-        while not proof.get("until_ok") and tries < 4 and (time.monotonic() < deadline - 0.35):
-            # storm: 3x3 jitter grid, then 14px above the box center (avatar/icon rule)
-            offs = [(0, 0), (8, 0), (-8, 0), (0, 8), (0, -8), (8, 8), (-8, -8), (8, -8), (-8, 8)]
-            ox_, oy_ = offs[tries % len(offs)]
-            if tries >= 4 and role in ("avatar", "icon", ""):
-                ox_, oy_ = 0, -14
-            _motion_warp_click(x + ox_, y + oy_)
-            tries += 1
+        proof = _check_until(u_kind, u_needle, win_info, None, deadline)
+        while not proof.get("until_ok") and time.monotonic() < deadline - 0.2:
+            # Re-click ONLY if the first click visibly did nothing (swallowed
+            # by a focus change etc.) and re-clicking cannot undo a toggle.
+            # Otherwise keep polling: the UI may just be slow.
+            after_probe = _probe(x, y)
+            untouched = (before_crop is not None and after_probe is not None
+                         and 0 <= _pixel_delta(before_crop, after_probe, 24, 24) < 1.5)
+            if untouched and tries < 3 and do in ("click", "right") and not any(n in ctype for n in _NO_RETRY):
+                offs = [(0, 0), (0, -4), (0, 4)]
+                ox_, oy_ = offs[tries % len(offs)]
+                if role in ("avatar", "icon") and tries == 2:
+                    ox_, oy_ = 0, -14
+                click_at(x + ox_, y + oy_, "right" if do == "right" else "left", 1)
+                tries += 1
             time.sleep(0.12)
             proof = _check_until(u_kind, u_needle, win_info, None, deadline)
+        if u_kind == "gone" and pre_present is False:
+            proof["warning"] = f"{u_needle!r} was not visible BEFORE the click - 'gone' proves nothing"
+            proof["until_ok"] = False
 
     # visual delta + window-under-point evidence (cheap, always)
     hwnd_after, title_after = _window_under_point(x, y)
     visual_delta = None
-    try:
-        after_shot = desktop_native.take_region_screenshot(bx0, by0, 48, 48, quality=95)
-        _ap = after_shot.get("inspection_image_path")
-        if _ap and before_crop is not None:
-            from PIL import Image as _PILImage
-            visual_delta = _pixel_delta(before_crop, _PILImage.open(_ap), 24, 24)
-    except Exception:
-        pass
+    after_crop = _probe(x, y)
+    if before_crop is not None and after_crop is not None:
+        visual_delta = _pixel_delta(before_crop, after_crop, 24, 24)
 
+    # Success ONLY with a satisfied postcondition. No `until` = unverified,
+    # whatever the click API returned (README: fired_unverified is a miss).
+    status = "hit" if proof.get("until_ok") else "fired_unverified"
     result = {
-        "status": "hit" if (proof.get("until_ok", True)) else "fired_unverified",
+        "status": status,
         "action": do,
         "hit": {"x": x, "y": y, "method": aim["method"], "box": aim.get("box"),
                 "resolved_name": aim.get("name", "")},
@@ -818,8 +1060,8 @@ def point_sync(do: str = "click", target: Any = None, target2: Any = None,
         "visual_delta": round(visual_delta, 1) if isinstance(visual_delta, float) and visual_delta >= 0 else None,
         "ms": _ms(),
     }
-    if aim.get("error") == "ambiguous":
-        result["status"] = "ambiguous"
+    if not u_kind:
+        result["note"] = "no until given: pass until=... to get a proven 'hit'"
     return result
 
 
@@ -830,8 +1072,21 @@ def point_async(**kwargs) -> Any:
 
 
 def click_box_with_proof(box: Dict[str, int], window: str = "", until: str = "") -> Dict[str, Any]:
-    """Warp-click a known box with the storm+proof pipeline (used by see.click_text)."""
+    """Warp-click a known box with the proof pipeline (used by see.click_text).
+    Callers on the event loop must go through click_box_async instead."""
     return point_sync(do="click", target=box, window=window, until=until, timeout_ms=1200)
+
+
+def click_box_async(box: Dict[str, int], window: str = "", until: str = "") -> Any:
+    import asyncio
+    return asyncio.get_running_loop().run_in_executor(
+        _EXEC, lambda: click_box_with_proof(box, window=window, until=until))
+
+
+def run_on_input_thread(fn, *args, **kwargs) -> Any:
+    """Awaitable: run any input-touching callable on the single mouse thread."""
+    import asyncio
+    return asyncio.get_running_loop().run_in_executor(_EXEC, lambda: fn(*args, **kwargs))
 
 
 def shutdown() -> None:

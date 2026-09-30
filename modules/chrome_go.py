@@ -69,9 +69,17 @@ def list_chrome_windows() -> List[Dict[str, Any]]:
 
 
 def focus_hwnd(hwnd: int) -> bool:
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    user32.BringWindowToTop(hwnd)
-    return bool(user32.SetForegroundWindow(hwnd))
+    """Focus and PROVE it (GetForegroundWindow() == hwnd). Only restores
+    minimized windows - SW_RESTORE on a maximized window un-maximizes it."""
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    try:
+        from . import desktop_native
+        return desktop_native._force_foreground(hwnd)
+    except Exception:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd)
 
 
 def _host(url: str) -> str:
@@ -111,12 +119,25 @@ def _focus_matching(url: str) -> Optional[Dict[str, Any]]:
 
 
 def _focus_any_chrome() -> Optional[Dict[str, Any]]:
+    """Topmost Chrome window (EnumWindows is z-ordered), focused WITH proof.
+    Returns the window dict with 'focused': bool."""
     wins = list_chrome_windows()
     if not wins:
         return None
-    w = wins[0]
-    focus_hwnd(w["hwnd"])
+    fg = int(user32.GetForegroundWindow() or 0)
+    w = next((x for x in wins if x["hwnd"] == fg), wins[0])
+    w = dict(w)
+    w["focused"] = (w["hwnd"] == fg) or focus_hwnd(w["hwnd"])
     return w
+
+
+def _refuse_unfocused(w: Dict[str, Any], what: str) -> Optional[Dict[str, Any]]:
+    # Typing into whatever else has focus (a terminal, a chat box) is the
+    # worst possible failure mode - refuse instead.
+    if not w.get("focused"):
+        return {"status": "focus_failed", "error": f"Chrome window {w.get('title')!r} did not take "
+                f"the foreground; refusing to send {what} into another window"}
+    return None
 
 
 def op_go(url: str = "", profile: str = "Kartik", until: str = "") -> Dict[str, Any]:
@@ -188,6 +209,9 @@ def op_type(text: str = "", submit: bool = False) -> Dict[str, Any]:
     w = _focus_any_chrome()
     if not w:
         return {"status": "error", "error": "no Chrome window to type into"}
+    refused = _refuse_unfocused(w, 'text')
+    if refused:
+        return refused
     typed = keys.type_text(text, submit=submit)
     typed["window"] = w["title"]
     return typed
@@ -197,6 +221,9 @@ def op_keys(combo: str = "") -> Dict[str, Any]:
     w = _focus_any_chrome()
     if not w:
         return {"status": "error", "error": "no Chrome window for keys"}
+    refused = _refuse_unfocused(w, 'keys')
+    if refused:
+        return refused
     sent = keys.send_keys(combo)
     sent["window"] = w["title"]
     return sent
@@ -206,6 +233,9 @@ def op_urlbar() -> Dict[str, Any]:
     w = _focus_any_chrome()
     if not w:
         return {"status": "error", "error": "no Chrome window for urlbar"}
+    refused = _refuse_unfocused(w, 'urlbar')
+    if refused:
+        return refused
     sent = keys.send_keys("ctrl+l")
     sent["op"] = "urlbar"
     sent["window"] = w["title"]

@@ -1,9 +1,12 @@
-# ==============================================================================# main.py - Autonomous Workstation MCP Hub v2.3
+# ==============================================================================# main.py - Autonomous Workstation MCP Hub v2.4
 #
-# DESIGN: 5 fat tools, not 31 primitives. Complexity lives INSIDE the tools.
+# DESIGN: 5 fat tools + XeroSpatial, not 31 primitives. Complexity lives
+# INSIDE the tools.
 #   web_task        - open page, act, verify, wait for the product (autopilot)
 #   see             - vision: capture + OCR + landmarks + real MCP image content
+#                     (grid=true -> XeroSpatial frame_id + 16x8 cell map)
 #   point           - named click with until-proof (ghost/sniper/flick)
+#   spatial_point   - XeroSpatial: grid/semantic targeting, locks, proof
 #   chrome_session  - real Chrome go/type/keys + debug CDP ops
 #   pc              - shell, files, search, processes, kill, notify
 #
@@ -15,9 +18,11 @@
 # ==============================================================================
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 
 import uvicorn
@@ -117,6 +122,7 @@ async def see(
     ocr_lang: str = "en-US",
     thumbnail_width: int = 800,
     quality: int = 60,
+    grid: bool = False,
 ) -> Any:
     """
     The hub's eyes: bring the target to front, capture physical pixels, run
@@ -132,6 +138,9 @@ async def see(
         ocr_lang: OCR language tag (default en-US)
         thumbnail_width: max image width returned (default 800px)
         quality: JPEG quality of the returned image (default 60)
+        grid: true -> overlay the XeroSpatial 16x8 grid (A1..P8) on the image
+            and return frame_id + cells{cell: labels}. Pass that frame_id to
+            spatial_point so it can refuse to act on a stale view.
 
     Returns JSON with: ocr {full_text, lines[{text,x,y,w,h}]} where boxes are
     PHYSICAL pixels (feed straight into mouse_click - zero scale math),
@@ -141,7 +150,7 @@ async def see(
     """
     result = await see_mod.see(
         target=target, want=want, click_text=click_text,
-        ocr_lang=ocr_lang, thumbnail_width=thumbnail_width, quality=quality,
+        ocr_lang=ocr_lang, thumbnail_width=thumbnail_width, quality=quality, grid=grid,
     )
     return _finalize(result)
 
@@ -206,11 +215,110 @@ async def point(
 
 
 # ==============================================================================
-# Tool 4: chrome_session - one session tool, never 4 CDP toys
+# Tool 3b: spatial_point - XeroSpatial grid + semantic targeting
 # ==============================================================================
 
 @mcp.tool()
-def chrome_session(
+async def spatial_point(
+    action: str = "click",
+    target: Any = None,
+    cell: str = "",
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    target2: Any = None,
+    to_cell: str = "",
+    to_x: Optional[float] = None,
+    to_y: Optional[float] = None,
+    command: str = "",
+    window: str = "",
+    near: str = "",
+    until: str = "",
+    text: str = "",
+    keys: str = "",
+    amount: int = 0,
+    ms: int = 0,
+    scope: str = "screen",
+    display: Optional[int] = None,
+    frame_id: str = "",
+    min_confidence: float = 0.0,
+    motion: str = "sniper",
+    timeout_ms: int = 2500,
+    retries: int = 1,
+    dry_run: bool = False,
+    debug: bool = False,
+) -> Any:
+    """
+    XeroSpatial: act on the screen by GRID ADDRESS or by LABEL, with proof.
+    The screen (or window, scope="window") is a 16x8 grid: columns A..P left
+    to right, rows 1..8 top to bottom. Each cell has local coords 0..64
+    (0,0 = top-left, 32,32 = centre). "G4/B3" refines into a 4x4 sub-grid.
+    Get the grid + frame_id from see(grid=true) or action="observe".
+
+    Args:
+        action: click | double | right | move | hover | drag | scroll | type |
+            key | wait | observe | stats | cancel
+        target: label text ("Save"), a cell ("G4", "1:G4" = display 1,
+            "G4/B3"), or {"cell":"G4","x":32,"y":48} / {"text":"Save"}
+        cell, x, y: spatial address + local 0..64 coords (alternative to target)
+        target2 / to_cell, to_x, to_y: drag destination
+        command: compact protocol instead of params, ';' or newline chains
+            up to 20 steps, e.g. 'CLICK G4 32 48; TYPE "hello"; KEY ENTER' or
+            'CLICK "Save" IN P1 UNTIL "Saved"' or 'DRAG B2 10 10 TO C5 32 32'
+        window: title substring to focus first (focus proof or abort)
+        near: disambiguation anchor text for label targets
+        until: proof condition (same grammar as point: "X gone", "X",
+            "url contains Y"). Without it a fired action is "fired_unverified".
+        text / keys: for type / key ("ctrl+l", "enter")
+        amount: scroll notches (+ up), ms: wait duration
+        scope: "screen" (display grid) | "window" (grid over the focused window)
+        display: monitor index for cell addresses (multi-monitor)
+        frame_id: the frame you looked at; cell targets are REFUSED
+            (stale_frame) if that region changed since
+        min_confidence: refuse below this (default 0.6)
+        motion: "sniper" (default) | "human"
+        timeout_ms: budget for resolve+fire+proof (default 2500)
+        retries: extra safe retries (0..2) - only if the target is provably
+            untouched; toggles are never re-clicked
+        dry_run: resolve + report the point, never fire
+        debug: return an annotated image (grid, target, safe point, timings)
+
+    Returns {status, point{x,y,cell,local}, resolved{source,confidence,label},
+    proof, frame{frame_id,age_ms}, timing_ms{stage...}}. Statuses: hit
+    (proven) | ok (typed/waited/observed) | fired_unverified | dry_run |
+    refused_low_confidence | ambiguous | not_found | stale_frame |
+    focus_failed | occluded | input_blocked | vision_unavailable | timeout |
+    cancelled | bad_request. Only "hit" means the until-condition was PROVEN.
+    """
+    from modules.spatial import tool as spatial_tool
+    from modules.spatial.backends import engine
+    eng = engine()
+    if (action or "").strip().lower() == "cancel":
+        # NOT queued behind the input thread: stamps a cancel that every
+        # queued/in-flight action submitted before now honours.
+        eng.cancel()
+        return {"status": "ok", "cancelled_before": "all actions submitted before this call"}
+    submitted_at = time.monotonic()
+    result = await mouse_runtime.run_on_input_thread(
+        spatial_tool.run, eng, action=action, command=command, submitted_at=submitted_at,
+        window=window, scope=scope, until=until, min_confidence=min_confidence,
+        motion=motion, timeout_ms=timeout_ms, frame_id=frame_id, retries=retries,
+        dry_run=dry_run, debug=debug,
+        target=target, cell=cell, x=x, y=y, target2=target2, to_cell=to_cell,
+        to_x=to_x, to_y=to_y, near=near, text=text, keys=keys, amount=amount,
+        display=display, ms=ms,
+    ) if (action or "").strip().lower() != "stats" else spatial_tool.stats(eng)
+    return _finalize(result)
+
+
+# ==============================================================================
+# Tool 4: chrome_session - one session tool, never 4 CDP toys
+# ==============================================================================
+
+_INPUT_OPS = {"go", "type", "keys", "urlbar", "focus"}
+
+
+@mcp.tool()
+async def chrome_session(
     op: str = "status",
     url: str = "",
     profile: str = "Kartik",
@@ -235,9 +343,13 @@ def chrome_session(
       open         - open `url` as a new CDP tab (debug Chrome only)
     For Kartik / Gmail / NotebookLM always use op=go, never ensure_debug.
     """
-    return chrome_control.dispatch(
+    call = lambda: chrome_control.dispatch(  # noqa: E731
         op, url=url, profile=profile, until=until, text=text, keys=keys, submit=submit,
     )
+    if (op or "").strip().lower() in _INPUT_OPS:
+        # keyboard/focus work is serialized with every mouse action
+        return await mouse_runtime.run_on_input_thread(call)
+    return await asyncio.to_thread(call)
 
 
 # ==============================================================================
@@ -245,7 +357,7 @@ def chrome_session(
 # ==============================================================================
 
 @mcp.tool()
-def pc(
+async def pc(
     op: str,
     command: Optional[str] = None,
     cwd: Optional[str] = None,
@@ -293,7 +405,9 @@ def pc(
         extension=extension, detail=detail, pid=pid, port=port,
         title=title, message=message,
     ).items() if v is not None or k in ("content", "message", "title")}
-    return pc_ops.dispatch(op, **kw)
+    # run in a worker thread: a 120 s shell command must not freeze the
+    # event loop (and with it every other MCP request / SSE stream)
+    return await asyncio.to_thread(pc_ops.dispatch, op, **kw)
 
 
 # ==============================================================================
@@ -339,13 +453,23 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f" [!] Mouse runtime   : warmup failed ({e})")
 
+        try:
+            pruned = desktop_native.prune_inspections()
+            if pruned:
+                print(f" [x] Inspections     : pruned {pruned} old region captures")
+        except Exception:
+            pass
+
         cal = desktop_native.verify_calibration()
         config.save_status_snapshot({"display": cal})
         print("\n" + "=" * 72)
-        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.3 (5 fat tools)")
+        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.4 (5 fat tools + spatial_point)")
         print(f" [x] Display         : {cal['physical_resolution']} "
               f"(DPI aware: {cal['dpi_aware']}, scaling trap: {cal['scaling_trap_active']})")
-        print(f" [x] Bearer Token    : {config.BEARER_TOKEN}")
+        tok = config.BEARER_TOKEN or ""
+        # never print the secret: logs/console captures leak it
+        print(f" [x] Bearer Token    : {tok[:4]}...{tok[-2:] if len(tok) > 8 else ''} "
+              f"({len(tok)} chars; full value in .mcp_token)")
         print(f" [x] MCP Endpoint    : http://127.0.0.1:{config.PORT}/mcp")
         print(f" [x] Health          : http://127.0.0.1:{config.PORT}/health")
         try:
@@ -364,7 +488,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "server": config.SERVER_NAME, "version": "2.3.0"}
+    return {"status": "running", "server": config.SERVER_NAME, "version": "2.4.0"}
 
 
 @app.get("/ping")
@@ -376,7 +500,7 @@ async def ping():
 async def mcp_discovery():
     return {
         "version": "2.0",
-        "serverInfo": {"name": config.SERVER_NAME, "version": "2.3.0"},
+        "serverInfo": {"name": config.SERVER_NAME, "version": "2.4.0"},
         "protocol": "modelcontextprotocol",
         "transport": "streamable-http",
         "endpoints": [
@@ -384,7 +508,7 @@ async def mcp_discovery():
             {"type": "health", "url": "/health"},
         ],
         "auth": "bearer",
-        "tools": ["web_task", "see", "point", "chrome_session", "pc"],
+        "tools": ["web_task", "see", "point", "spatial_point", "chrome_session", "pc"],
         "capabilities": {"tools": {"listChanged": False}},
     }
 
@@ -407,7 +531,7 @@ class BearerAuthMiddleware:
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        if scope["type"] in ("http", "websocket"):
             path = scope.get("path", "")
             if path in self.EXEMPT_PATHS:
                 await self.app(scope, receive, send)
@@ -430,6 +554,10 @@ class BearerAuthMiddleware:
                 scheme = auth.split(" ")[0][:16] if auth else "(empty)"
                 print(f"[auth] 401: scheme={scheme!r} header_len={len(auth)} "
                       f"expected_token_len={len(self.token)}", flush=True)
+                if scope["type"] == "websocket":
+                    # reject the handshake (HTTP 403 per ASGI spec)
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
                 resp = JSONResponse(
                     {"error": "Missing or malformed Authorization header. Expected 'Bearer <TOKEN>'."},
                     status_code=401,

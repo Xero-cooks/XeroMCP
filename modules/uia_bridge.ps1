@@ -10,9 +10,14 @@
 #   find   {id, window: "<title substr or empty>", name: "<substr>", limit}
 #          -> {ok, id, candidates:[{name,x,y,w,h,invoke,ctype,enabled}], scanned, ms}
 #   invoke {id, window, name, index}
-#          -> invokes InvokePattern on the Nth name match (ghost click:
-#             the control is clicked WITHOUT moving the cursor)
+#          -> invokes InvokePattern on the element whose bounds match `rect`
+#             (the candidate the caller actually scored), else the Nth match
+#             (ghost click: the control is clicked WITHOUT moving the cursor)
 #          -> {ok, id, invoked, name, ms}
+#   Optional `hwnd` scopes the search to that exact top-level window (a title
+#   substring can match the wrong window). Offscreen, disabled and empty-rect
+#   elements are skipped. v2.4: the result list no longer shadows PowerShell's
+#   automatic "matches" variable.
 # ==============================================================================
 $ErrorActionPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -36,6 +41,28 @@ function Find-TopWindow([string]$hint) {
         if ($h -eq '' -or $n.ToLower().Contains($h)) { return $w }
     }
     return $null
+}
+
+function Get-Scope($req) {
+    if ($req.hwnd) {
+        try {
+            $h = [IntPtr]::new([long]$req.hwnd)
+            $w = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+            if ($w) { return $w }
+        } catch {}
+    }
+    return (Find-TopWindow "$($req.window)")
+}
+
+function Test-Usable($e) {
+    try {
+        if ($e.Current.IsOffscreen) { return $false }
+        $r = $e.Current.BoundingRectangle
+        if ($r.IsEmpty) { return $false }
+        if ([double]::IsInfinity($r.X) -or [double]::IsInfinity($r.Width)) { return $false }
+        if ($r.Width -le 0 -or $r.Height -le 0) { return $false }
+        return $true
+    } catch { return $false }
 }
 
 function Get-ElementInfo($e) {
@@ -82,7 +109,7 @@ while ($true) {
             $resp.ok = $true
         }
         elseif ($op -eq 'find' -or $op -eq 'invoke') {
-            $win = Find-TopWindow "$($req.window)"
+            $win = Get-Scope $req
             if (-not $win) {
                 $resp.error = 'window_not_found'
             } else {
@@ -91,34 +118,54 @@ while ($true) {
                 $pat = "$($req.name)".ToLower()
                 $limit = 12
                 if ($req.limit) { $limit = [int]$req.limit }
-                $matches = New-Object System.Collections.ArrayList
-                $elems   = New-Object System.Collections.ArrayList
+                if ($op -eq 'invoke') { $limit = 64 }
+                $found = New-Object System.Collections.ArrayList
+                $elems = New-Object System.Collections.ArrayList
                 $total = $all.Count
                 $cap = $total
                 if ($cap -gt 6000) { $cap = 6000 }
                 for ($i = 0; $i -lt $cap; $i++) {
-                    if ($sw.ElapsedMilliseconds -gt 1500) { break }
+                    if ($sw.ElapsedMilliseconds -gt 1500) { $resp.truncated = $true; break }
                     $e = $all.Item($i)
                     if (-not $e) { continue }
                     $n = $e.Current.Name
                     if ($n -and $pat -ne '' -and $n.ToLower().Contains($pat)) {
+                        if (-not (Test-Usable $e)) { continue }
                         [void]$elems.Add($e)
-                        [void]$matches.Add((Get-ElementInfo $e))
-                        if ($matches.Count -ge $limit) { break }
+                        [void]$found.Add((Get-ElementInfo $e))
+                        if ($found.Count -ge $limit) { break }
                     }
                 }
                 if ($op -eq 'find') {
-                    $resp.ok = ($matches.Count -gt 0)
-                    $resp.candidates = $matches
+                    $resp.ok = $true
+                    if ($found.Count -eq 0) { $resp.error = 'element_not_found' }
+                    $resp.candidates = $found
                     $resp.scanned = $cap
                     $resp.window_total = $total
                 } else {
                     $idx = 0
                     if ($req.index) { $idx = [int]$req.index }
-                    if ($matches.Count -eq 0) {
+                    if ($found.Count -eq 0) {
                         $resp.error = 'element_not_found'
                     } else {
-                        if ($idx -ge $matches.Count) { $idx = 0 }
+                        if ($idx -ge $found.Count) { $idx = 0 }
+                        $skip = $false
+                        if ($req.rect) {
+                            # pick the element whose centre matches the scored candidate
+                            $want_cx = [double]$req.rect.x + [double]$req.rect.w / 2
+                            $want_cy = [double]$req.rect.y + [double]$req.rect.h / 2
+                            $best = -1; $bestd = 1e9
+                            for ($k = 0; $k -lt $found.Count; $k++) {
+                                $f = $found[$k]
+                                $d = [math]::Abs($f.x + $f.w / 2 - $want_cx) + [math]::Abs($f.y + $f.h / 2 - $want_cy)
+                                if ($d -lt $bestd) { $bestd = $d; $best = $k }
+                            }
+                            if ($best -lt 0 -or $bestd -gt 6) { $skip = $true } else { $idx = $best }
+                        }
+                    }
+                    if ($found.Count -gt 0 -and $skip) {
+                        $resp.error = 'scored_element_not_found'
+                    } elseif ($found.Count -gt 0) {
                         $el = $elems[$idx]
                         $invoked = $false
                         $how = ''
@@ -146,7 +193,7 @@ while ($true) {
                         }
                         $resp.ok = $invoked
                         if ($invoked) {
-                            $resp.invoked = $true; $resp.how = $how; $resp.name = $matches[$idx].name
+                            $resp.invoked = $true; $resp.how = $how; $resp.name = $found[$idx].name
                         } else {
                             $resp.error = 'no_clickable_pattern'
                         }
