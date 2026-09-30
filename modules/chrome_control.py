@@ -166,6 +166,11 @@ def op_status() -> Dict[str, Any]:
     chrome = _find_chrome_exe()
     listening = cdp_listening()
     info = _cdp_json("/json/version") if listening else None
+    try:                                     # record the capability once; consumers reuse it
+        from .runtime import get_runtime
+        get_runtime().caps.set("cdp", "available" if listening else "unavailable", epoch=config.CDP_ENDPOINT)
+    except Exception:
+        pass
     return {
         "cdp_available": listening,
         "cdp_endpoint": config.CDP_ENDPOINT,
@@ -286,6 +291,8 @@ def dispatch(op: str, **kwargs) -> Dict[str, Any]:
             text=kwargs.get("text", "") or "",
             submit=bool(kwargs.get("submit", False)),
         ),
+        "profiles": chrome_go.op_profiles,
+        "profile": chrome_go.op_profile,
         "keys": lambda: chrome_go.op_keys(kwargs.get("keys", "") or ""),
         "urlbar": lambda: chrome_go.op_urlbar(),
     }

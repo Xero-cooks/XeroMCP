@@ -310,7 +310,7 @@ def test_vision_unavailable_cell_click_still_works_label_does_not():
     assert r["status"] == "vision_unavailable" and not any(c[0] == "pointer" for c in w.calls)
     r = _click(eng, cell="A1", x=32, y=32)
     assert r["status"] == "fired_unverified"                     # no until -> never "hit"
-    assert r["proof"]["how"] == "no_until"
+    assert r["proof"]["how"] == "not_requested" and r["proof"]["until_ok"] is None
 
 
 @pytest.mark.parametrize("res,origin", [((1920, 1080), (0, 0)), ((2560, 1440), (0, 0)),

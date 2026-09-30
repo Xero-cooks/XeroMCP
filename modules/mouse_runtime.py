@@ -790,18 +790,34 @@ def _check_until(kind: str, needle: str, win_info: Dict[str, Any],
                  pre_ocr_lines: Optional[List[Dict[str, Any]]] = None,
                  deadline: Optional[float] = None) -> Dict[str, Any]:
     if not kind:
-        return {"until_ok": True, "how": "none"}
+        # nothing was asked, so nothing was proven: never report success here
+        return {"until_ok": None, "how": "not_requested"}
     time_left = (deadline - time.monotonic()) if deadline else 5.0
     if kind == "url":
-        try:
+        # CDP is probed ONCE per epoch (endpoint); when unavailable, fall back to
+        # window-title / UIA / OCR evidence immediately instead of re-probing.
+        from modules.runtime import get_runtime
+        caps = get_runtime().caps
+
+        def _cdp_tabs():
+            import json as _json
             import urllib.request
             with urllib.request.urlopen(f"{config.CDP_ENDPOINT}/json", timeout=2) as r:
-                import json as _json
-                tabs = _json.loads(r.read().decode("utf-8", "replace"))
+                return _json.loads(r.read().decode("utf-8", "replace")) or None
+        st, tabs = caps.probe("cdp", _cdp_tabs, epoch=config.CDP_ENDPOINT)
+        if st == "available":
             hit = any(needle in (t.get("url") or "") for t in tabs)
             return {"until_ok": hit, "how": "cdp_urls"}
-        except Exception as e:
-            return {"until_ok": False, "how": "cdp_urls", "error": f"cdp unavailable: {type(e).__name__}"}
+        title = (win_info.get("title") or "")
+        if needle.lower() in title.lower():
+            return {"until_ok": True, "how": "window_title", "note": "cdp unavailable (cached); title match is weaker than a URL match"}
+        present = _uia_text_present(needle, title) if time_left > 0.35 else None
+        if present is True:
+            return {"until_ok": True, "how": "uia_text", "note": "cdp unavailable (cached)"}
+        lines = pre_ocr_lines if pre_ocr_lines is not None else _ocr_window_text(win_info)
+        if lines is not None and _find_all_ocr(lines, needle):
+            return {"until_ok": True, "how": "ocr_text", "note": "cdp unavailable (cached)"}
+        return {"until_ok": False, "how": "cdp_unavailable_fallback", "error": "cdp unavailable; url not confirmed by title/UIA/OCR"}
     # UIA fast path (menus/popup HWNDs are handled inside the bridge)
     present = None
     if time_left > 0.35:
@@ -1012,7 +1028,7 @@ def _point_sync(do, target, target2, near, window, until, role, motion,
 
     # ---- 6. proof in the same breath (+ SAFE retry) ----
     tries = 1
-    proof: Dict[str, Any] = {"until_ok": None, "how": "no_until"}
+    proof: Dict[str, Any] = {"until_ok": None, "how": "not_requested"}
     if u_kind:
         deadline = time.monotonic() + max(0.9, budget - (time.monotonic() - t0))
         time.sleep(0.12)  # let the UI react (menus render a beat after the click)

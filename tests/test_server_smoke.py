@@ -40,9 +40,9 @@ def _session(client):
 
 
 def test_health_and_discovery_are_public(client):
-    assert client.get("/health").json()["version"] == "2.4.0"
+    assert client.get("/health").json()["version"] == "2.5.0"
     d = client.get("/.well-known/mcp.json").json()
-    assert "spatial_point" in d["tools"] and len(d["tools"]) == 6
+    assert "spatial_point" in d["tools"] and len(d["tools"]) == 7
 
 
 def test_mcp_requires_token(client):
@@ -63,7 +63,7 @@ def test_tools_list_and_spatial_call(client):
     sid = _session(client)
     r = _rpc(client, "tools/list", rid=2, session=sid)
     names = [t["name"] for t in r.json()["result"]["tools"]]
-    assert names == ["web_task", "see", "point", "spatial_point", "chrome_session", "pc"]
+    assert names == ["web_task", "see", "point", "spatial_point", "xero", "chrome_session", "pc"]
     r = _rpc(client, "tools/call", {"name": "spatial_point", "arguments": {"action": "stats"}}, rid=3, session=sid)
     body = r.json()["result"]
     payload = json.loads(body["content"][0]["text"])
@@ -73,3 +73,34 @@ def test_tools_list_and_spatial_call(client):
     assert payload["status"] == "bad_request"
     r = _rpc(client, "tools/call", {"name": "spatial_point", "arguments": {"action": "cancel"}}, rid=5, session=sid)
     assert json.loads(r.json()["result"]["content"][0]["text"])["status"] == "ok"
+
+
+def _call(client, sid, name, args, rid):
+    r = _rpc(client, "tools/call", {"name": name, "arguments": args}, rid=rid, session=sid)
+    return json.loads(r.json()["result"]["content"][0]["text"])
+
+
+def test_xero_runtime_tool_contract(client):
+    sid = _session(client)
+    st = _call(client, sid, "xero", {"op": "status"}, 10)
+    assert st["status"] == "ok" and "capabilities" in st and "runtime" in st
+    ob = _call(client, sid, "xero", {"op": "observe"}, 11)
+    assert {"frame_id", "ts", "age_ms", "window", "browser", "visual", "interaction", "events"} <= set(ob)
+    assert "image" not in ob and len(json.dumps(ob)) < 6000                       # compact by default
+    assert _call(client, sid, "xero", {"op": "stream", "steps": []}, 12)["status"] == "bad_request"
+    assert _call(client, sid, "xero", {"op": "stream", "steps": [{"type": "explode"}]}, 13)["status"] == "bad_request"
+    assert _call(client, sid, "xero", {"op": "nope"}, 14)["status"] == "bad_request"
+    assert _call(client, sid, "xero", {"op": "caps"}, 15)["status"] == "ok"
+    assert _call(client, sid, "xero", {"op": "cancel"}, 16)["cancelled"] is True
+
+
+def test_finalize_shrinks_oversized_images():
+    import base64, io
+    import main
+    from PIL import Image
+    import os
+    im = Image.frombytes("RGB", (1600, 1200), os.urandom(1600 * 1200 * 3))     # incompressible noise
+    buf = io.BytesIO(); im.save(buf, format="JPEG", quality=95)
+    assert buf.tell() > main.MAX_IMAGE_BYTES
+    out = main._finalize({"image": {"data": base64.b64encode(buf.getvalue()).decode()}, "status": "ok"})
+    assert out[1]["image_bytes"] <= main.MAX_IMAGE_BYTES and "image" not in out[1]

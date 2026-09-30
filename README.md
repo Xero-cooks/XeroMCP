@@ -10,7 +10,7 @@ Repo: `Xero-cooks/XeroMCP` (public, branch `main`). Hub folder:
 
 ---
 
-## Tools (5 fat tools + `spatial_point` — complexity lives inside them)
+## Tools (5 fat tools + `spatial_point` + `xero` — complexity lives inside them)
 
 | Tool | Use for | Never use for |
 |---|---|---|
@@ -128,6 +128,49 @@ Safety contract:
 - `python tests/bench_spatial.py --live -n 20` — raw vs `point` vs `spatial_point` (cold / lock / cell), per-stage p50/p95.
 
 ---
+
+## XeroRuntime — `xero` (v2.5): one shared, continuously observed computer
+
+`see`, `point`, `spatial_point`, `chrome_session` and `xero` all read/write ONE
+`ComputerRuntime` (`modules/runtime/`): state, event buffer, target tracker,
+capability cache, sessions. Physical input is still ONLY on the single input
+thread; the runtime never injects.
+
+| ops (`xero`) | what |
+|---|---|
+| `observe` | compact state (frame_id, age, window, observed Chrome profile, change class + cells, tracked targets with bbox/cells/confidence, text, grid + `space_id`, active action, stale flag, capabilities) and only the events NEW since your last observe. No screenshot unless `image=true`. `refresh`/`deep` force a fresh tick. |
+| `events` | WINDOW_CHANGED, FOCUS_CHANGED, PROFILE_CHANGED, URL_CHANGED, MODAL_APPEARED, SCREEN_CHANGED, TARGET_APPEARED/MOVED/DISAPPEARED, ACTION_STARTED/COMPLETED/INTERRUPTED, VERIFICATION_PASSED/FAILED, CAPABILITY_CHANGED, STATE_INVALIDATED (bounded ring, 256) |
+| `stream` | `steps:[{type,target|cell|x,y,until?,expect?}]` in ONE round trip. Each step EXPECT→ACT→VERIFY. Before each step the world is compared with what the previous step verified; modal/focus/profile change ⇒ `interrupted` (`fired:false`), soft change (screen/navigation) ⇒ re-acquire once. `motion:"trajectory"` walks the cursor in waypoints with focus/target checks between them. Steps without `until` are accepted only with *weak, labelled* state evidence, else `unverified`. |
+| `profiles` / `profile` | Chrome profile registry (from Chrome `Local State`) + the profile of the FOREGROUND Chrome window with evidence |
+| `caps` / `status` / `cancel` / `reset` | capability cache, counters, cancel, invalidate |
+
+**Perception**: background thread only while a session is active (300 s TTL).
+Fast loop 4 Hz (cursor, foreground window, geometry) → medium loop 1 Hz (display-signature
+change class, Chrome profile/title) → deep (OCR frame + target tracking) only on uncertainty:
+window/navigation/major layout change or a tracked target's region changed (≥1.5 s apart).
+Cursor-only/animation changes keep locks and never trigger OCR.
+
+**Coordinates**: `see(grid=true)` now registers its frame through the same engine path as
+`spatial_point` (same surface/capture) and returns `coordinate_space` (`space_id`, monitor,
+dpi/scale, capture→physical mapping, `same_as_see_capture`). `space_id` changes when monitors or DPI change and
+invalidates targets/locks.
+
+**Chrome `go`** returns `requested_profile` vs `observed_profile`, `stages` (profile_verified,
+launch_requested, launch_started, window_found, tab_found, navigation_started,
+navigation_verified, destination_visible) and status `ok | profile_mismatch |
+navigation_unverified | focus_failed | launch_failed | profile_unknown | launched_unverified`.
+`already_open:true` ⇒ that profile's own window is foreground AND its active tab matches
+(`destination_evidence` says `window_title` or `url`; real Chrome has no CDP, so title is the evidence).
+Profile purposes live in `xero_profiles.json` (gitignored, see the `.example.json`); never guessed.
+
+**Verification**: nothing claims verification it didn't perform: no `until` ⇒ `until_ok:null, how:"not_requested"`.
+CDP is probed once per endpoint and cached (`caps`); when unavailable, url proofs fall back to
+window title → UIA → OCR immediately (weaker evidence is labelled).
+
+Windows caveat: the runtime, stream, trajectory and Chrome state machine are unit-tested on a
+simulated desktop (`python -m pytest tests -q`, `python tests/bench_runtime.py`). Real-input
+behaviour must be validated on Windows: `python tests/test_mouse.py`,
+`python tests/bench_spatial.py --live -n 20`.
 
 ## Hard never-do list
 

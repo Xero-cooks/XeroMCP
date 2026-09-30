@@ -92,7 +92,7 @@ def _host(url: str) -> str:
         return url.lower()
 
 
-def _title_matches(title: str, url: str) -> bool:
+def _title_matches_legacy(title: str, url: str) -> bool:
     t = (title or "").lower()
     host = _host(url)
     if not host:
@@ -140,69 +140,64 @@ def _refuse_unfocused(w: Dict[str, Any], what: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_REGISTRY = None
+
+
+def get_registry():
+    """Process-wide Chrome profile registry wired to the real Win32 providers."""
+    global _REGISTRY
+    if _REGISTRY is None:
+        from .runtime.chrome_registry import ChromeRegistry, ProfileInfo
+        seed = [ProfileInfo(directory=chrome_profiles.KARTIK["directory"], name=chrome_profiles.KARTIK["gaia"],
+                            email=chrome_profiles.KARTIK["email"], gaia_name=chrome_profiles.KARTIK["gaia"],
+                            aliases=["Kartik"])]
+        _REGISTRY = ChromeRegistry(windows_provider=list_chrome_windows,
+                                   foreground_provider=lambda: int(user32.GetForegroundWindow() or 0), seed=seed)
+    return _REGISTRY
+
+
+def _launch(argv: List[str]) -> bool:
+    try:
+        subprocess.Popen(argv, close_fds=False)
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def op_go(url: str = "", profile: str = "Kartik", until: str = "") -> Dict[str, Any]:
-    t0 = time.perf_counter()
+    """Open `url` in the REQUESTED Chrome profile and verify it stage by stage.
+    already_open=True only when that profile's own foreground window shows the
+    destination (see runtime/chrome_flow.py for the state machine)."""
     guard = chrome_profiles.refuse_debug_identity("go", profile, url)
     if guard:
         return guard
-    resolved = chrome_profiles.resolve_profile(profile)
-    if not resolved.get("ok"):
-        return resolved
-    directory = resolved["directory"]
-    target = (url or "").strip()
-    if not target:
-        target = "https://notebook.google.com"
-
-    existing = _focus_matching(target)
-    if existing:
-        proof = until_proof.check_until(until, url=target, title=existing["title"])
-        return {
-            "status": "ok" if proof.get("until_ok", True) else "launched_unverified",
-            "already_open": True,
-            "profile": resolved["name"],
-            "directory": directory,
-            "email": resolved["email"],
-            "url": target,
-            "title": existing["title"],
-            "proof": proof,
-            "ms": int((time.perf_counter() - t0) * 1000),
-        }
-
-    argv = [
-        chrome_profiles.CHROME_EXE,
-        f"--profile-directory={directory}",
-        target,
-    ]
+    from .runtime import chrome_flow, get_runtime
+    rt = get_runtime()
+    out = chrome_flow.go(get_registry(), (url or "").strip() or "https://notebook.google.com", profile or "Kartik", until,
+                         focus=focus_hwnd, launch=_launch, exe=chrome_profiles.CHROME_EXE,
+                         emit=lambda kind, **d: rt.events.emit(kind, **d))
     try:
-        subprocess.Popen(argv, close_fds=False)
-    except FileNotFoundError:
-        return {
-            "status": "error",
-            "error": f"chrome.exe not found at {chrome_profiles.CHROME_EXE}",
-        }
+        fg = (out.get("observed_profile") or {})
+        rt.update_browser({"profile": fg.get("name"), "directory": fg.get("directory"),
+                           "profile_verified": fg.get("verified"), "page_title": out.get("title"),
+                           "url": out.get("url") if out.get("verified") else None})
+    except Exception:
+        pass
+    # legacy keys older clients read
+    rp = out.get("requested_profile") or {}
+    out.setdefault("profile", rp.get("name"))
+    out.setdefault("directory", rp.get("directory"))
+    return out
 
-    matched = None
-    for _ in range(20):
-        time.sleep(0.1)
-        matched = _focus_matching(target)
-        if matched:
-            break
-    title = matched["title"] if matched else ""
-    proof = until_proof.check_until(until, url=target, title=title)
-    ok = bool(matched) or not until
-    return {
-        "status": "ok" if (ok and proof.get("until_ok", True)) else "launched_unverified",
-        "already_open": False,
-        "launched": True,
-        "profile": resolved["name"],
-        "directory": directory,
-        "email": resolved["email"],
-        "url": target,
-        "argv": argv,
-        "title": title,
-        "proof": proof,
-        "ms": int((time.perf_counter() - t0) * 1000),
-    }
+
+def op_profiles() -> Dict[str, Any]:
+    return {"status": "ok", "profiles": get_registry().registry_view()}
+
+
+def op_profile() -> Dict[str, Any]:
+    """Which profile is ACTUALLY in the foreground Chrome window right now."""
+    obs = get_registry().observe()
+    return {"status": "ok", "foreground": obs["foreground"], "windows": obs["windows"]}
 
 
 def op_type(text: str = "", submit: bool = False) -> Dict[str, Any]:

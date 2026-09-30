@@ -1,12 +1,14 @@
-# ==============================================================================# main.py - Autonomous Workstation MCP Hub v2.4
+# ==============================================================================# main.py - Autonomous Workstation MCP Hub v2.5
 #
-# DESIGN: 5 fat tools + XeroSpatial, not 31 primitives. Complexity lives
+# DESIGN: 5 fat tools + XeroSpatial + xero runtime, not 31 primitives. Complexity lives
 # INSIDE the tools.
 #   web_task        - open page, act, verify, wait for the product (autopilot)
 #   see             - vision: capture + OCR + landmarks + real MCP image content
 #                     (grid=true -> XeroSpatial frame_id + 16x8 cell map)
 #   point           - named click with until-proof (ghost/sniper/flick)
 #   spatial_point   - XeroSpatial: grid/semantic targeting, locks, proof
+#   xero            - ComputerRuntime: compact observe, events, action streams,
+#                     Chrome profile registry, capabilities (one shared state)
 #   chrome_session  - real Chrome go/type/keys + debug CDP ops
 #   pc              - shell, files, search, processes, kill, notify
 #
@@ -52,12 +54,36 @@ mcp = FastMCP(config.SERVER_NAME, host=config.HOST, port=config.PORT,
 # multimodal clients receive pixels as pixels.
 # ------------------------------------------------------------------------------
 
+MAX_IMAGE_BYTES = 400_000
+
+
+def _shrink_jpeg(raw: bytes, limit: int = MAX_IMAGE_BYTES) -> bytes:
+    """Keep image payloads small: re-encode oversized JPEGs (progressively
+    smaller) instead of returning multi-MB blobs that clients truncate."""
+    if len(raw) <= limit:
+        return raw
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        for scale, q in ((1.0, 55), (0.75, 50), (0.5, 45), (0.35, 40)):
+            j = im if scale == 1.0 else im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))))
+            buf = io.BytesIO()
+            j.save(buf, format="JPEG", quality=q, optimize=True)
+            if buf.tell() <= limit:
+                return buf.getvalue()
+        return buf.getvalue()
+    except Exception:
+        return raw
+
+
 def _finalize(result: Any):
     if isinstance(result, dict) and isinstance(result.get("image"), dict):
         img = result.pop("image")
         try:
-            raw = base64.b64decode(img.get("data", ""))
+            raw = _shrink_jpeg(base64.b64decode(img.get("data", "")))
             from mcp.server.fastmcp import Image
+            result["image_bytes"] = len(raw)
             return [Image(data=raw, format="jpeg"), result]
         except Exception:
             result["image_error"] = "image payload could not be encoded; re-run with include_image=false"
@@ -311,6 +337,96 @@ async def spatial_point(
 
 
 # ==============================================================================
+# Tool 3c: xero - the shared ComputerRuntime (state, events, streams, profiles)
+# ==============================================================================
+
+@mcp.tool()
+async def xero(
+    op: str = "observe",
+    steps: Optional[List[Dict[str, Any]]] = None,
+    session: str = "default",
+    since: Optional[int] = None,
+    refresh: bool = False,
+    deep: bool = False,
+    image: bool = False,
+    motion: str = "sniper",
+    timeout_ms: int = 2500,
+    name: str = "",
+    limit: int = 40,
+) -> Any:
+    """
+    The persistent computer runtime shared by see/point/spatial_point/chrome_session.
+    Perception keeps running in the background while a session is active, so
+    state is already there when you ask. Ops:
+      observe  {refresh?, deep?, image?, since?} -> COMPACT state: frame_id, age,
+               window, browser (observed Chrome profile), changed regions,
+               tracked targets (bbox + cells + confidence), visible text, grid /
+               coordinate-space id, active action, stale flag, capability cache,
+               and only the events NEW since your last observe. No screenshot
+               unless image=true (then the 16x8 grid image is attached).
+      events   {since?, limit?}   -> raw change events (WINDOW_CHANGED, URL_CHANGED,
+               MODAL_APPEARED, TARGET_MOVED, ACTION_INTERRUPTED, ...)
+      stream   {steps:[{type, target|cell|x,y, until?, expect?}], motion?}
+               -> several actions in ONE round trip. Types: move hover click
+               double_click right_click drag scroll type key wait wait_until
+               (condition) observe. Each step is EXPECT->ACT->VERIFY; the stream
+               stops (structured `interruption`, fired=false when nothing was
+               clicked) if a modal/focus/profile/navigation change breaks its
+               assumptions. Steps without `until` are only accepted with honest
+               'weak' state evidence; otherwise status=unverified. motion=
+               "trajectory" walks the cursor with per-waypoint interruption checks.
+      profiles -> Chrome profile registry (name, directory, open window, tab title)
+      profile  -> which profile the FOREGROUND Chrome window really is (+evidence)
+      caps     {name?} -> capability cache (cdp/...); pass name to reset it
+      status   -> runtime counters (ticks, screenshots, reacquisitions, probes)
+      cancel   -> cancel running/queued spatial actions and streams
+      reset    -> invalidate targets/locks/frames
+    """
+    from modules.runtime import api as rt_api, get_runtime
+    from modules.spatial import tool as spatial_tool
+    from modules.spatial.backends import engine
+    eng = await asyncio.to_thread(engine)
+    rt = get_runtime()
+    rt.session(session)
+    if rt.sampler and not (rt._thread and rt._thread.is_alive()):
+        rt.start()
+    o = (op or "observe").strip().lower()
+    if o == "stream":
+        return _finalize(await mouse_runtime.run_on_input_thread(
+            rt_api.run_stream, rt, eng, spatial_tool.run, steps, session, motion, int(timeout_ms)))
+    if o == "observe":
+        snap = await asyncio.to_thread(rt.observe, session, bool(refresh), bool(deep), since)
+        if image:
+            try:
+                from modules.spatial.debug_render import render_grid
+                f = eng.cache.peek()
+                if f is not None and f.image is not None:
+                    snap["image"] = render_grid(f, max_width=800, quality=55)
+            except Exception as e:
+                snap["image_error"] = f"{type(e).__name__}: {e}"
+        return _finalize(snap)
+    if o == "events":
+        return {"status": "ok", **rt.events.since(int(since or 0), limit=max(1, min(200, int(limit))))}
+    if o in ("profiles", "profile"):
+        from modules import chrome_go
+        return await asyncio.to_thread(chrome_go.op_profiles if o == "profiles" else chrome_go.op_profile)
+    if o == "caps":
+        if name:
+            rt.caps.reset(name)
+        return {"status": "ok", "capabilities": rt.caps.snapshot(), "probes": dict(rt.caps.stats)}
+    if o == "status":
+        return rt_api.status_of(rt, eng)
+    if o == "cancel":
+        eng.cancel()
+        return {"status": "ok", "cancelled": True}
+    if o == "reset":
+        rt.invalidate("manual reset")
+        return {"status": "ok"}
+    return {"status": "bad_request", "error": f"unknown op {op!r}",
+            "valid": ["observe", "events", "stream", "profiles", "profile", "caps", "status", "cancel", "reset"]}
+
+
+# ==============================================================================
 # Tool 4: chrome_session - one session tool, never 4 CDP toys
 # ==============================================================================
 
@@ -329,10 +445,15 @@ async def chrome_session(
 ) -> Dict[str, Any]:
     """
     One Chrome session engine. Ops:
+      profiles     - registry of real Chrome profiles (name, directory, open window/tab)
+      profile      - the profile of the FOREGROUND Chrome window, with evidence
       go           - REAL Chrome identity. chrome.exe --profile-directory.
                      Kartik = Profile 11. Never kill Chrome, never picker,
-                     never debug user-data-dir. Returns already_open if that
-                     profile is already on `url`.
+                     never debug user-data-dir. already_open=true ONLY if THAT profile's
+                     own foreground window shows `url`; result has stages
+                     (profile_verified, window_found, ..., destination_visible),
+                     requested_profile vs observed_profile, and statuses ok |
+                     profile_mismatch | navigation_unverified | focus_failed | ...
       type         - type `text` into focused real Chrome; submit=Enter
       keys         - chord e.g. ctrl+l (real Chrome, SendInput)
       urlbar       - ctrl+l in real Chrome
@@ -463,7 +584,7 @@ async def lifespan(app: FastAPI):
         cal = desktop_native.verify_calibration()
         config.save_status_snapshot({"display": cal})
         print("\n" + "=" * 72)
-        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.4 (5 fat tools + spatial_point)")
+        print(" [x] AUTONOMOUS WORKSTATION MCP HUB v2.5 (5 fat tools + spatial_point + xero runtime)")
         print(f" [x] Display         : {cal['physical_resolution']} "
               f"(DPI aware: {cal['dpi_aware']}, scaling trap: {cal['scaling_trap_active']})")
         tok = config.BEARER_TOKEN or ""
@@ -488,7 +609,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "server": config.SERVER_NAME, "version": "2.4.0"}
+    return {"status": "running", "server": config.SERVER_NAME, "version": "2.5.0"}
 
 
 @app.get("/ping")
@@ -500,7 +621,7 @@ async def ping():
 async def mcp_discovery():
     return {
         "version": "2.0",
-        "serverInfo": {"name": config.SERVER_NAME, "version": "2.4.0"},
+        "serverInfo": {"name": config.SERVER_NAME, "version": "2.5.0"},
         "protocol": "modelcontextprotocol",
         "transport": "streamable-http",
         "endpoints": [
@@ -508,7 +629,7 @@ async def mcp_discovery():
             {"type": "health", "url": "/health"},
         ],
         "auth": "bearer",
-        "tools": ["web_task", "see", "point", "spatial_point", "chrome_session", "pc"],
+        "tools": ["web_task", "see", "point", "spatial_point", "xero", "chrome_session", "pc"],
         "capabilities": {"tools": {"listChanged": False}},
     }
 

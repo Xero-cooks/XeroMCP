@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to xero_profiles.json (gitignored). Keys are a Chrome profile display name or directory. Purpose/aliases are YOURS - the runtime never guesses them.",
+  "profiles": {
+    "Profile 3": {"purpose": "infra / deployments", "aliases": ["xerocore"]}
+  }
+}

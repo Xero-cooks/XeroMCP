@@ -21,3 +21,6 @@ venv/
 .vscode/
 .xerospatial_memory.json
 .xerospatial_bench/
+
+# personal Chrome profile metadata (purposes/aliases) - see xero_profiles.example.json
+xero_profiles.json

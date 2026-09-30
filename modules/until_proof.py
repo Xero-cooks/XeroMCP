@@ -22,7 +22,7 @@ def check_until(until: str, *, url: str = "", title: str = "", visible_text: str
     spec = parse_until(until)
     kind = spec.get("kind")
     if kind == "none":
-        return {"until_ok": True, "how": "no_until"}
+        return {"until_ok": None, "how": "not_requested"}
     needle = (spec.get("needle") or "").lower()
     hay_url = (url or "").lower()
     hay_title = (title or "").lower()

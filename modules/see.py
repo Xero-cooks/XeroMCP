@@ -151,33 +151,29 @@ def _image_content(pil_img, max_width: int = 800, quality: int = 60) -> Optional
         return None
 
 
-def _spatial_frame(img, lines, ocr_ok, t, title, max_width, quality) -> Dict[str, Any]:
+def _spatial_frame(thumbnail_width: int, quality: int, see_capture: Dict[str, Any]) -> Dict[str, Any]:
+    """Register the grid frame through the SAME engine path spatial_point uses
+    (same surface, same capture, same coordinate space) - not from see()'s own
+    screenshot - so grid cells mean the same physical pixels in both tools."""
     from modules.spatial.backends import engine
     from modules.spatial.debug_render import render_grid
-    from modules.spatial.frame import Element, SpatialFrame
-    from modules.spatial.geometry import FrameTransform, Grid, Rect
-    ox, oy = (t["rect"]["x"], t["rect"]["y"]) if t.get("rect") else (0, 0)
-    surface = Rect(ox, oy, img.width, img.height)
+    from modules.runtime.coords import frame_meta
     eng = engine()
-    info = {}
-    try:
-        info = desktop_native.foreground_info() or {}
-    except Exception:
-        pass
-    frame = SpatialFrame(surface=surface, grid=Grid(surface, eng.cols, eng.rows),
-                         transform=FrameTransform(ox, oy, 1.0, 1.0), image=img,
-                         elements=[Element(text=str(l.get("text", "")),
-                                           rect=Rect(ox + int(l["x"]), oy + int(l["y"]),
-                                                     max(1, int(l["w"])), max(1, int(l["h"]))),
-                                           source="ocr") for l in lines],
-                         window={"hwnd": info.get("hwnd"), "title": title,
-                                 "rect": info.get("rect"), "exe": info.get("exe")},
-                         ocr_ok=ocr_ok, ocr_engine="see")
-    eng.cache.put(frame)
-    return {"frame_id": frame.frame_id, "grid": {"cols": eng.cols, "rows": eng.rows,
-            "surface": surface.to_dict() if hasattr(surface, "to_dict") else list(surface)},
+    ctx = eng._context("")
+    frame = eng.observe(ctx, scope="screen", force=True)
+    space = eng.runtime.space if eng.runtime else None
+    meta = frame_meta(frame, space)
+    surface = frame.surface.to_dict()
+    cap = see_capture
+    same = (cap.get("region") is None and (cap["w"], cap["h"]) == (surface["w"], surface["h"]))
+    return {"frame_id": frame.frame_id,
+            "grid": {"cols": eng.cols, "rows": eng.rows, "surface": surface},
+            "coordinate_space": {**meta, "see_capture": {"w": cap["w"], "h": cap["h"]},
+                                 "same_as_see_capture": same,
+                                 **({} if same else {"note": "see() captured a different region than the grid surface; "
+                                                            "OCR boxes are physical px, grid cells refer to grid.surface"})},
             "cells": frame.cell_map(),
-            "image": render_grid(frame, max_width=max(320, int(max_width)), quality=int(quality))}
+            "image": render_grid(frame, max_width=max(320, int(thumbnail_width)), quality=int(quality))}
 
 
 # ------------------------------------------------------------------------------
@@ -215,6 +211,11 @@ async def see(target: Any = "foreground",
     from PIL import Image
     img = Image.open(path)
     img.load()
+    try:                                   # keep the shared runtime's window state fresh
+        from modules.runtime import get_runtime
+        get_runtime().update_window(desktop_native.foreground_info() or {})
+    except Exception:
+        pass
     out: Dict[str, Any] = {
         "status": "ok",
         "mode": t["mode"],
@@ -275,8 +276,9 @@ async def see(target: Any = "foreground",
     #     address with spatial_point(cell=..., frame_id=...)
     if grid:
         try:
-            out.update(_spatial_frame(img, all_lines, ocr_ok, t, out.get("window_title", ""),
-                                      thumbnail_width, quality))
+            out.update(await asyncio.to_thread(
+                _spatial_frame, thumbnail_width, quality,
+                {"w": img.width, "h": img.height, "region": t.get("rect")}))
         except Exception as e:
             out["grid_error"] = f"{type(e).__name__}: {e}"
 

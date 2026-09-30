@@ -97,6 +97,44 @@ class WindowsBackends:
         time.sleep(max(0.0, s))
 
 
+class WindowsSampler:
+    """Perception feeds for ComputerRuntime. READ-ONLY: never injects input."""
+
+    def __init__(self, eng) -> None:
+        self.eng = eng
+        self.b = eng.b
+
+    def fast(self) -> Dict[str, Any]:
+        info = self.b.foreground() or {}
+        fg = {k: info.get(k) for k in ("hwnd", "title", "rect", "exe", "pid")} if info.get("ok", True) else {}
+        return {"cursor": self.b.cursor_pos(), "fg": fg}
+
+    def _ctx(self) -> Dict[str, Any]:
+        return self.eng._context("")
+
+    def medium(self) -> Dict[str, Any]:
+        from modules.runtime.changes import signature_gray
+        from modules.runtime.coords import describe_space
+        ctx = self._ctx()
+        surface, _ = self.eng._surface(ctx, "screen", None)
+        out: Dict[str, Any] = {"space": describe_space(ctx["displays"], self.eng.cols, self.eng.rows),
+                               "bounds": (surface.x, surface.y, surface.w, surface.h)}
+        img = self.b.capture(surface)
+        if img is not None:
+            out["sig"] = signature_gray(img)
+        if "chrome" in str(ctx.get("exe") or "").lower():
+            from modules import chrome_go
+            fg = chrome_go.get_registry().observe()["foreground"]
+            if fg:
+                out["browser"] = {"profile": fg["profile"], "directory": fg["directory"], "profile_verified": fg["verified"],
+                                  "page_title": fg["page_title"], "hwnd": fg["hwnd"], "url": None}
+        return out
+
+    def deep(self) -> Dict[str, Any]:
+        self.eng.observe(self._ctx(), force=True)     # feeds the runtime via ingest_frame
+        return {"ingested": True}
+
+
 _ENGINE = None
 
 
@@ -116,4 +154,9 @@ def engine():
         if os.environ.get("XEROSPATIAL_MEMORY", "1") == "0":
             persist = ""
         _ENGINE = SpatialEngine(WindowsBackends(), memory=SpatialMemory(persist_path=persist or None))
+        from modules.runtime import ComputerRuntime, set_runtime, get_runtime
+        rt = get_runtime()
+        rt.sampler = WindowsSampler(_ENGINE)
+        rt.on_invalidate = _ENGINE.invalidate_all
+        _ENGINE.runtime = rt
     return _ENGINE

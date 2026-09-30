@@ -24,6 +24,7 @@ from .resolver import SOURCE_TRUST, Candidate, ambiguity, match_score, rank
 from .safe_point import hazard_zones, safe_point
 from .telemetry import TELEMETRY, Stopwatch, Telemetry
 from .verify import CHANGE_THRESHOLD, evidence, poll_until
+from ..runtime.coords import describe_space
 
 GHOST_CTYPES = ("button", "menuitem", "hyperlink", "tabitem", "splitbutton")
 NO_RETRY_CTYPES = ("checkbox", "radiobutton", "toggle", "combobox", "edit", "slider")
@@ -59,8 +60,9 @@ class Resolution:
 class SpatialEngine:
     def __init__(self, backends, cache: Optional[VisionCache] = None, locks: Optional[LockStore] = None,
                  memory: Optional[SpatialMemory] = None, telemetry: Optional[Telemetry] = None,
-                 cols: int = 16, rows: int = 8) -> None:
+                 cols: int = 16, rows: int = 8, runtime=None) -> None:
         self.b = backends
+        self.runtime = runtime
         self.cache = cache or VisionCache()
         self.locks = locks or LockStore()
         self.memory = memory or SpatialMemory()
@@ -70,6 +72,20 @@ class SpatialEngine:
         # cancelled (a stale cancel must never kill a later, unrelated action).
         self._cancel_ts = -1.0
         self._submitted = threading.local()
+
+    def _rt(self, method: str, *a: Any, **k: Any) -> None:
+        """Best-effort call into the shared ComputerRuntime (never breaks an action)."""
+        rt = self.runtime
+        if rt is None:
+            return
+        try:
+            getattr(rt, method)(*a, **k)
+        except Exception:
+            pass
+
+    def invalidate_all(self, reason: str) -> None:
+        self.cache.invalidate(reason)
+        self.locks.clear()
 
     # ==========================================================================
     # cancellation
@@ -144,6 +160,8 @@ class SpatialEngine:
                 els, ok, engine = self._ocr_region(frame, region)
             frame.elements, frame.ocr_ok, frame.ocr_engine = els, ok, engine
         self.cache.put(frame)
+        self._rt("set_space", describe_space(ctx["displays"], self.cols, self.rows))
+        self._rt("ingest_frame", frame)
         return frame
 
     def _ocr_focus_region(self, ctx: Dict[str, Any], surface: Rect) -> Rect:
@@ -448,6 +466,9 @@ class SpatialEngine:
         deadline = time.monotonic() + max(0.4, timeout_ms / 1000.0)
         until = until or action.until
         out: Dict[str, Any] = {"action": action.verb}
+        if action.verb not in ("observe", "wait"):
+            self._rt("action_started", {"type": action.verb, "target": (action.target.label or action.target.cell) if action.target else "",
+                                        "until": until, "text": action.text})
         try:
             self._check_cancel()
             with sw.span("context"):
@@ -569,6 +590,7 @@ class SpatialEngine:
             fg_before = self.b.foreground().get("hwnd")
 
         motion_used = ""
+        out_traj = None
         with sw.span("act.fire"):
             ghost_ok = (verb == "click" and motion != "human" and res.invoke and res.source in ("uia", "lock")
                         and any(g in (res.ctype or "").lower() for g in GHOST_CTYPES))
@@ -577,6 +599,13 @@ class SpatialEngine:
                 r = self.b.uia_invoke(res.text, ctx.get("title", ""), ctx.get("hwnd"), res.rect)
                 if r and r.get("ok"):
                     motion_used = f"ghost:{r.get('how', 'invoke')}"
+            if not motion_used and motion == "trajectory":
+                traj = self._trajectory(ctx, res, pt, probe, before_sig, fg_before)
+                if traj["status"] != "reached":
+                    raise SpatialError("interrupted", f"trajectory interrupted: {traj.get('reason')} (nothing clicked)",
+                                       reason=traj.get("reason"), trajectory=traj, point={"x": pt[0], "y": pt[1]})
+                out_traj = {k: traj.get(k) for k in ("steps_done", "steps_planned", "retargets")}
+                motion = "sniper"        # the final press still goes through the proven pointer path
             if not motion_used:
                 r = self.b.pointer(verb, pt[0], pt[1],
                                    x2=pt2[0] if pt2 else None, y2=pt2[1] if pt2 else None,
@@ -587,7 +616,7 @@ class SpatialEngine:
                                        point={"x": pt[0], "y": pt[1]})
                 motion_used = r.get("motion", "warp")
 
-        proof: Dict[str, Any] = {"until_ok": None, "how": "none"}
+        proof: Dict[str, Any] = {"until_ok": None, "how": "not_requested"}
         tries = 1
         with sw.span("verify"):
             if until:
@@ -628,7 +657,7 @@ class SpatialEngine:
             proof = {"until_ok": bool(ev.get("cursor_on_target")), "how": "cursor_position"}
         else:
             status = "fired_unverified"
-            proof = {"until_ok": None, "how": "no_until",
+            proof = {"until_ok": None, "how": "not_requested",
                      "note": "no postcondition given; see evidence.changed"}
 
         # ---- learning / invalidation ----
@@ -650,8 +679,39 @@ class SpatialEngine:
                 self.locks.invalidate(label, "screen_changed")
             self.cache.invalidate("screen_changed")
         return {"status": status, "point": {"x": pt[0], "y": pt[1]}, "motion": motion_used,
-                "tries": tries, "proof": proof, "evidence": ev,
+                **({"trajectory": out_traj} if out_traj else {}), "tries": tries, "proof": proof, "evidence": ev,
                 **({"to": {"x": pt2[0], "y": pt2[1]}} if pt2 else {})}
+
+    def _trajectory(self, ctx, res: Resolution, pt, probe: Rect, before_sig, fg_before) -> Dict[str, Any]:
+        """Walk the cursor to `pt`; between waypoints check cancel, focus, the target
+        region and (when tracked) target movement. Injection = the same pointer()
+        backend on the same input thread; nothing else moves the mouse."""
+        from ..runtime.trajectory import plan_path, run_trajectory
+        start = self.b.cursor_pos()
+        path = plan_path(start, pt)
+        hwnd0 = fg_before
+
+        def check(i, p):
+            if self._is_cancelled():
+                return "cancelled"
+            if self.b.foreground().get("hwnd") != hwnd0:
+                return "focus_lost"
+            if i and i % 2 == 0:
+                cur = self._region_sig_now(probe)
+                if before_sig is not None and cur is not None and sig_diff(before_sig, cur) > STALE_REGION_TOLERANCE * 2:
+                    return "target_region_changed"
+            return None
+
+        def retarget():
+            if res.rect is None or self.runtime is None:
+                return None
+            t = self.runtime.tracker.find_label(res.text or "")
+            if t and t.state == "visible" and t.last_seen_frame and abs(t.velocity[0]) + abs(t.velocity[1]) > 20:
+                r = Rect(*t.bbox)
+                return r.center
+            return None
+        return run_trajectory(path, lambda p: self.b.pointer("move", p[0], p[1], motion="warp"),
+                              check_fn=check, retarget_fn=retarget)
 
     def _keyboard(self, action: Action, ctx, until: str, deadline: float, sw: Stopwatch) -> Dict[str, Any]:
         fg = self.b.foreground()
@@ -668,7 +728,7 @@ class SpatialEngine:
                                    max(deadline, time.monotonic() + 0.6), sleep=self.b.sleep)
             out.update(status="hit" if proof.get("until_ok") else "fired_unverified", proof=proof)
         else:
-            out.update(status="fired_unverified", proof={"until_ok": None, "how": "no_until"})
+            out.update(status="fired_unverified", proof={"until_ok": None, "how": "not_requested"})
         if self.b.foreground().get("hwnd") != fg.get("hwnd"):
             out["focus_changed_during_input"] = True
         return out
@@ -703,6 +763,8 @@ class SpatialEngine:
                 out["debug_error"] = f"{type(e).__name__}: {e}"
         out["timing_ms"] = sw.report()
         self.telemetry.record(op, out["timing_ms"])
+        if op not in ("observe", "wait"):
+            self._rt("action_finished", out)
         return out
 
     @staticmethod
@@ -715,6 +777,7 @@ class SpatialEngine:
             "occluded": "a popup/other window covers the point; close it or target it instead",
             "refused_low_confidence": "observe again or give a cell/near anchor",
             "vision_unavailable": "screen capture failed (locked screen / secure desktop?)",
+            "interrupted": "the screen/focus changed while the cursor was moving; nothing was clicked - observe and retry",
             "input_blocked": "Windows blocked injected input (elevated target window? run the hub elevated)",
         }.get(status, "")
 
